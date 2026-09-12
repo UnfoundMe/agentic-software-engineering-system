@@ -8,11 +8,13 @@ turning one natural-language requirement into a reviewable engineering outcome.
 > | Area | State |
 > |---|---|
 > | Scaffold, infra, CI, docs | done |
-> | Kernel: events, hash chain, state fold, graph validation, JSONL store | **done and tested** (87 tests, mypy `--strict`) |
-> | Kernel: scheduler, gates, cancellation, checkpoint | not started |
+> | Kernel: events, hash chain, state fold, graph validation, JSONL store | **done and tested** |
+> | Kernel: scheduler, gates, cancellation, checkpoint, lineage | **done and tested** (139 tests, mypy `--strict`) — parallel dispatch, bounded repair cycles, human approval incl. resuming across separate `run()` calls, budget-based safe-stop |
+> | `workflows/greenfield.yaml` (Stage 1 graph, loads and validates) | done |
 > | Postgres store, Alembic, `ases db *` CLI | not started |
-> | Artifact contracts, workflow YAML, policy packs | not started |
+> | Artifact contracts, policy packs | not started |
 > | Agents, providers, sandbox, validation, dashboard | not started |
+> | Dynamic subgraph admission wired into a live run; full re-planning (Phase 7) | not started — see `kernel/scheduler.py`'s module docstring for the exact boundary |
 >
 > **`uv run ases` does not work yet** — the CLI module does not exist, so
 > `scripts/dev-up.*` and the CI database steps will fail. The kernel is

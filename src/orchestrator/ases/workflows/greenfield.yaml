@@ -1,0 +1,156 @@
+# Stage 1 greenfield workflow - docs/03 section 3.3's node choreography.
+#
+# Handler names match the agent plane docs/02 plans to build (Phase 4); none
+# of them exist yet, so this graph is exercised today only via
+# `WorkflowGraph.from_yaml` + `validate_graph()` (see
+# tests/unit/test_workflows.py) - it is not yet wired into a live Scheduler
+# run. That wiring is Phase 4 work, once real agents exist to be its handlers.
+#
+# Known simplification, stated plainly: DECOMPOSE's dynamic subgraph (the
+# IMPL_TASK_* fan-out) is not expressible in a static YAML file, since it is
+# admitted at runtime via `WorkflowGraph.with_subgraph`. This file therefore
+# hard-codes two implementation tasks (impl_domain, impl_api) as a stand-in
+# for what the decomposer would actually propose - real task count and shape
+# come from the decomposer's output once it exists.
+
+name: greenfield
+description: >
+  Stage 1 greenfield path: a well-defined requirement becomes a reviewed,
+  tested .NET service. No codebase index or impact analysis - there is
+  nothing to analyze yet.
+
+entry:
+  - req
+
+nodes:
+  - id: req
+    kind: agent
+    handler: requirements
+    produces: RequirementSpec
+    cycle_budget: 3 # bounds the clarification cycle if gate1 rejects
+    timeout_seconds: 180
+
+  - id: gate1
+    kind: gate
+    requires_approval: true
+    description: Human sign-off on the normalized requirement.
+
+  - id: arch
+    kind: agent
+    handler: architect
+    produces: DesignSpec
+    timeout_seconds: 180
+
+  - id: gate2
+    kind: gate
+    requires_approval: true
+    description: Human sign-off on the design and layering (claude.md section 9).
+
+  - id: scaffold
+    kind: agent
+    handler: scaffold
+    produces: SolutionSkeleton
+    timeout_seconds: 120
+
+  - id: decompose
+    kind: agent
+    handler: decompose
+    produces: TaskGraph
+    timeout_seconds: 60
+
+  # Stand-ins for the decomposer's dynamic subgraph - see the module note above.
+  - id: impl_domain
+    kind: agent
+    handler: implementer
+    produces: CodePatch
+    timeout_seconds: 300
+
+  - id: impl_api
+    kind: agent
+    handler: implementer
+    produces: CodePatch
+    timeout_seconds: 300
+
+  - id: barrier
+    kind: barrier
+    join: all
+
+  - id: test_gen
+    kind: agent
+    handler: tester
+    produces: TestSuite
+    timeout_seconds: 180
+
+  - id: test_run
+    kind: tool
+    handler: dotnet_test
+    join: any # ready on first arrival OR after a repair completes
+    cycle_budget: 2
+    timeout_seconds: 300
+
+  - id: repair
+    kind: agent
+    handler: implementer
+    produces: CodePatch
+    timeout_seconds: 300
+
+  - id: review
+    kind: agent
+    handler: reviewer
+    produces: ReviewReport
+    timeout_seconds: 180
+
+  - id: sec_scan
+    kind: tool
+    handler: security_scan
+    produces: PolicyViolation
+    timeout_seconds: 120
+
+  - id: docs_gen
+    kind: agent
+    handler: docs
+    produces: DocsPatch
+    timeout_seconds: 120
+
+  - id: quality_gate
+    kind: barrier
+    join: all
+
+  - id: release
+    kind: agent
+    handler: release
+    produces: ReleaseReport
+    timeout_seconds: 120
+
+  - id: gate3
+    kind: gate
+    requires_approval: true
+    description: Human release approval.
+
+  - id: summary
+    kind: terminal
+
+edges:
+  - { source: req, target: gate1 }
+  - { source: gate1, target: arch }
+  - { source: gate1, target: req, condition: on_rejected }
+  - { source: arch, target: gate2 }
+  - { source: gate2, target: scaffold }
+  - { source: scaffold, target: decompose }
+  - { source: decompose, target: impl_domain }
+  - { source: decompose, target: impl_api }
+  - { source: impl_domain, target: barrier }
+  - { source: impl_api, target: barrier }
+  - { source: barrier, target: test_gen }
+  - { source: test_gen, target: test_run }
+  - { source: test_run, target: repair, condition: on_failure }
+  - { source: repair, target: test_run, condition: always }
+  - { source: test_run, target: review }
+  - { source: test_run, target: sec_scan }
+  - { source: test_run, target: docs_gen }
+  - { source: review, target: quality_gate }
+  - { source: sec_scan, target: quality_gate }
+  - { source: docs_gen, target: quality_gate }
+  - { source: quality_gate, target: release }
+  - { source: release, target: gate3 }
+  - { source: gate3, target: summary }
