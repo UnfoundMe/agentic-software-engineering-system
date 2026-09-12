@@ -1,0 +1,20 @@
+# Normalise line endings so the repo behaves identically on Windows and Linux.
+# This matters more than usual here: agent-generated C# is hashed for artifact
+# content-addressing, and a CRLF/LF flip would change the hash and spuriously
+# invalidate approvals and trigger re-planning.
+* text=auto eol=lf
+
+# Windows-only entry points keep CRLF.
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# Binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.ico  binary
+
+# Cassettes and event-log exports are append-structured JSONL; never merge them.
+*.jsonl   -merge -diff
+*.otlp.jsonl -merge -diff

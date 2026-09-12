@@ -1,0 +1,59 @@
+# ---- Secrets -------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# ---- .NET ----------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+TestResults/
+.vs/
+BenchmarkDotNet.Artifacts/
+
+# ---- Orchestrator runtime artifacts --------------------------------------
+# Run outputs are reproducible from the event log; they are not source.
+runs/*
+!runs/.gitkeep
+
+# Sandbox worktrees are disposable by design and must never be committed.
+.sandbox/
+sandboxes/
+
+# ---- Agent-generated workload --------------------------------------------
+# src/url-shortener is produced by the orchestrator at runtime. Only the
+# frozen, reviewed baseline under workloads/url-shortener/baseline/ is source.
+src/url-shortener/src/*
+!src/url-shortener/src/.gitkeep
+src/url-shortener/tests/*
+!src/url-shortener/tests/.gitkeep
+src/url-shortener/*.sln
+src/url-shortener/Directory.Packages.props
+
+# ---- LLM cassettes -------------------------------------------------------
+# Cassettes ARE committed: they are what makes the demo reproducible offline.
+# (No ignore rule here. This comment is deliberate, so nobody adds one.)
+
+# ---- Editors / OS --------------------------------------------------------
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

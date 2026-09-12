@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  orchestrator:
+    name: Orchestrator (Python)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ases
+          POSTGRES_USER: ases_su
+          POSTGRES_PASSWORD: ci_local_only
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ases_su -d ases"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ases
+      POSTGRES_SUPERUSER_PASSWORD: ci_local_only
+      ASES_CONTROL_PASSWORD: ci_local_only
+      ASES_APP_PASSWORD: ci_local_only
+      WORKLOAD_APP_PASSWORD: ci_local_only
+      # Cassette replay: CI never calls a live model. Determinism is the point.
+      ASES_LLM_MODE: replay
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+      - name: Bootstrap database
+        run: uv run ases db bootstrap
+
+      - name: Bootstrap is idempotent
+        # The Phase 0 acceptance criterion: a second run changes nothing and
+        # fails nothing. This is the test that catches an accidentally
+        # first-run-only bootstrap.
+        run: uv run ases db bootstrap
+
+      - name: Migrate
+        run: uv run ases db upgrade
+
+      - name: Test
+        run: uv run pytest --cov --cov-report=xml
+
+      - name: Invariants
+        # Each test attempts to violate an architectural rule and asserts the
+        # attempt is refused and logged. These must never be skipped.
+        run: uv run pytest tests/invariants -m invariant
+
+  workload:
+    name: Workload (.NET)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build and test the frozen baseline
+        # The baseline is the reviewed, committed output of a greenfield run.
+        # Until Phase 4 produces one, this is a no-op rather than a failure.
+        run: |
+          if [ -n "$(find workloads/url-shortener/baseline -name '*.sln' -print -quit)" ]; then
+            dotnet build workloads/url-shortener/baseline --warnaserror
+            dotnet test  workloads/url-shortener/baseline --no-build
+          else
+            echo "No frozen baseline yet (expected before Phase 4). Skipping."
+          fi

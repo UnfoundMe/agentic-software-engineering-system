@@ -1,0 +1,91 @@
+[project]
+name = "ases"
+version = "0.1.0"
+description = "Agentic Software Engineering System - a governed orchestration kernel that drives LLM agents through the SDLC"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # Artifact contracts - every agent output is validated against a model
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    # Event store
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # LLM boundary
+    "anthropic>=0.40",
+    "httpx>=0.27",
+    # Interfaces
+    "typer>=0.15",
+    "rich>=13.9",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sse-starlette>=2.1",
+    # Workflow and policy definitions
+    "pyyaml>=6.0",
+    # Observability
+    "structlog>=24.4",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-exporter-otlp-proto-common>=1.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-pyyaml>=6.0",
+]
+
+[project.scripts]
+ases = "ases.interfaces.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestrator/ases"]
+
+# ---------------------------------------------------------------------------
+# Lint / type / test
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src/orchestrator", "tests"]
+# Documentation code samples are illustrative and deliberately condensed.
+# Formatting them normalises away the layout that makes them readable.
+exclude = ["docs", "workloads", "src/url-shortener"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "ASYNC", "S"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src/orchestrator"
+packages = ["ases"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: requires Postgres (run scripts/dev-up first)",
+    "invariant: asserts an architectural rule cannot be violated",
+]
+
+[tool.coverage.run]
+source = ["src/orchestrator/ases"]
+branch = true

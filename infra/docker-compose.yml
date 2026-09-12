@@ -1,0 +1,57 @@
+# ASES local infrastructure.
+#
+# Deliberately minimal: Postgres and Redis only. No Grafana, no Prometheus,
+# no OTel collector - traces are written to a file (docs/04 and docs/02 Phase 9).
+#
+# Deliberately NO /docker-entrypoint-initdb.d mount. Those scripts run only
+# when the data directory is empty, so they silently stop applying after the
+# first start. Roles, schemas and grants are created by `ases db bootstrap`,
+# which is idempotent and re-runnable. See docs/04 section 1.3.
+
+name: ases
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ases-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ases}
+      POSTGRES_USER: ases_su
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      # Deterministic collation: agent-generated schemas and hashed artifacts
+      # must sort and compare identically across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Named volume, not a bind mount: the event log is the audit record and
+      # must survive `docker compose down`. Bind mounts on Windows also bring
+      # permission and performance problems.
+      - ases_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ases_su -d ${POSTGRES_DB:-ases}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ases-redis
+    # No persistence by design. Redis serves the WORKLOAD only (cache and job
+    # queue), never the kernel. Both are reconstructible; persisting a cache
+    # would leak stale entries between demo runs.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+volumes:
+  ases_pgdata:
+    name: ases_pgdata
