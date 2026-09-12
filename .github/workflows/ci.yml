@@ -86,7 +86,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Build and test the frozen baseline
         # The baseline is the reviewed, committed output of a greenfield run.

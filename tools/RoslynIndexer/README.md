@@ -1,6 +1,6 @@
 # RoslynIndexer — **Stage 2, not yet built**
 
-A .NET 9 console application that will analyse the generated C# workload using
+A .NET 10 console application that will analyse the generated C# workload using
 `Microsoft.CodeAnalysis.CSharp` and speak JSON over stdio to the Python
 orchestrator.
 
