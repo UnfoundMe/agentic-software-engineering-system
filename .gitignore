@@ -15,6 +15,7 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 dist/
@@ -54,6 +55,10 @@ src/url-shortener/Directory.Packages.props
 
 # ---- Editors / OS --------------------------------------------------------
 .idea/
+.vscode/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---- Claude Code local state ----------------------------------------------
+.claude/settings.local.json
