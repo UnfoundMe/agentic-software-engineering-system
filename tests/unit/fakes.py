@@ -9,6 +9,7 @@ to end with fake agents."
 from __future__ import annotations
 
 import asyncio
+import time
 
 from ases.kernel.gates import ApprovalDecision
 from ases.kernel.graph import NodeSpec
@@ -42,15 +43,28 @@ class SequenceExecutor:
 
 
 class SlowExecutor:
-    """Sleeps before returning - used to prove genuine concurrent dispatch."""
+    """Sleeps before returning, recording exactly when it started and
+    finished. Two `SlowExecutor`s dispatched concurrently will have
+    *overlapping* intervals; dispatched sequentially, they cannot - this is
+    what proves genuine concurrency without relying on a wall-clock threshold,
+    which is inherently flaky under CPU contention or a loaded machine."""
 
     def __init__(self, outcome: NodeExecutionOutcome, delay: float) -> None:
         self.outcome = outcome
         self.delay = delay
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
 
     async def execute(self, node: NodeSpec, state: RunState) -> NodeExecutionOutcome:
+        self.started_at = time.monotonic()
         await asyncio.sleep(self.delay)
+        self.finished_at = time.monotonic()
         return self.outcome
+
+    def overlaps(self, other: SlowExecutor) -> bool:
+        assert self.started_at is not None and self.finished_at is not None
+        assert other.started_at is not None and other.finished_at is not None
+        return self.started_at < other.finished_at and other.started_at < self.finished_at
 
 
 class ScriptedApprovals:

@@ -3,23 +3,26 @@
 A governed orchestration kernel that drives LLM agents through the full SDLC,
 turning one natural-language requirement into a reviewable engineering outcome.
 
-> **Status: Phase 1 in progress.**
+> **Status: Phase 0 and Phase 1 complete.** Phase 2 (LLM boundary) not started.
 >
 > | Area | State |
 > |---|---|
 > | Scaffold, infra, CI, docs | done |
-> | Kernel: events, hash chain, state fold, graph validation, JSONL store | **done and tested** |
-> | Kernel: scheduler, gates, cancellation, checkpoint, lineage | **done and tested** (139 tests, mypy `--strict`) — parallel dispatch, bounded repair cycles, human approval incl. resuming across separate `run()` calls, budget-based safe-stop |
+> | Kernel: events, hash chain, state fold, graph validation | **done and tested** |
+> | Kernel: scheduler, gates, cancellation, checkpoint, lineage | **done and tested** — parallel dispatch, bounded repair cycles, human approval incl. resuming across separate `run()` calls, budget-based safe-stop |
+> | `JsonlEventStore` (portable) + `PostgresEventStore` (source of truth) | **done and tested against a live container** — see docs/06 for how to verify this yourself |
+> | Alembic (control schema: `events` table + 4 derived views) | done |
+> | `ases db bootstrap` / `upgrade` / `reset-workload` | done, idempotency verified |
+> | `ases export` / `replay` | done — replay verified to work with Postgres stopped entirely |
+> | Pydantic artifact contracts (14, one per workflow `produces:` kind) | done |
 > | `workflows/greenfield.yaml` (Stage 1 graph, loads and validates) | done |
-> | Postgres store, Alembic, `ases db *` CLI | not started |
-> | Artifact contracts, policy packs | not started |
-> | Agents, providers, sandbox, validation, dashboard | not started |
+> | Policy packs (Phase 3), agents/providers/sandbox/dashboard (Phase 2+) | not started, by design — see docs/02 |
 > | Dynamic subgraph admission wired into a live run; full re-planning (Phase 7) | not started — see `kernel/scheduler.py`'s module docstring for the exact boundary |
 >
-> **`uv run ases` does not work yet** — the CLI module does not exist, so
-> `scripts/dev-up.*` and the CI database steps will fail. The kernel is
-> exercised by `uv run pytest` and `uv run python scripts/demo_kernel.py`,
-> neither of which needs a database.
+> 184 tests (unit + integration + invariants), mypy `--strict`, ruff clean.
+> `./scripts/dev-up.sh` now works end to end - see
+> [`docs/06-VALIDATION-GUIDE.md`](docs/06-VALIDATION-GUIDE.md) to reproduce
+> and cross-check everything above yourself.
 
 ---
 

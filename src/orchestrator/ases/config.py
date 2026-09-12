@@ -114,6 +114,16 @@ class Settings(BaseSettings):
         """
         return self._dsn(self.ases_app_user, self.ases_app_password)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def workload_app_dsn(self) -> str:
+        """Agent-generated EF Core migrations. Same database as everything
+        else - `workload_test` is a schema, not a separate database - but
+        `workload_app`'s `search_path` is set to it by bootstrap, and it has
+        no `USAGE` on `control` at all: not a lesser privilege within the
+        same namespace, a different namespace entirely."""
+        return self._dsn(self.workload_app_user, self.workload_app_password)
+
     def run_dir(self, run_id: str) -> Path:
         return self.ases_runs_dir / run_id
 

@@ -47,3 +47,35 @@ Copy-Item .env.example .env
 
 `dev-up` passes `--wait`, so the healthcheck gates bootstrap and it cannot race
 a database that is still starting.
+
+## If `dev-up` fails with "password authentication failed for user ases_su"
+
+The container is healthy, the password in `.env` is correct, and it still
+fails - this happened during development on a machine with a **native
+PostgreSQL service already installed and listening on 5432**. Docker's own
+port mapping never gets a chance to bind that port; every connection to
+`localhost:5432` from the host silently reaches the *other* Postgres instead,
+which has never heard of `ases_su`.
+
+Check with (Windows):
+
+```powershell
+Get-NetTCPConnection -LocalPort 5432 -State Listen
+Get-Process -Id <OwningProcess>   # look for a process literally named "postgres"
+```
+
+If that's the cause, set a different port in `.env` and recreate the
+container:
+
+```
+POSTGRES_PORT=5433
+```
+
+```powershell
+docker compose --env-file .env -f infra/docker-compose.yml down -v
+.\scripts\dev-up.ps1
+```
+
+Redis (6379) does not have this problem in practice - on Windows it is
+normally owned by Docker's own relay (`com.docker.backend.exe` /
+`wslrelay.exe`), not a native service, so a conflict there would be unusual.

@@ -8,7 +8,6 @@ and separate so a failure points at one mechanism, not a tangle of them.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from uuid import UUID
 
@@ -127,21 +126,24 @@ async def test_parallel_nodes_actually_run_concurrently(
             Edge(source="barrier", target="done"),
         ),
     )
-    delay = 0.15
+    left = SlowExecutor(ok(), delay=0.2)
+    right = SlowExecutor(ok(), delay=0.2)
     executors: dict[str, NodeExecutor] = {
         "split": FixedExecutor(ok()),
-        "left": SlowExecutor(ok(), delay),
-        "right": SlowExecutor(ok(), delay),
+        "left": left,
+        "right": right,
     }
 
-    started = time.monotonic()
     state = await make_scheduler(graph, store, executors).run(run_id)
-    elapsed = time.monotonic() - started
 
     assert state.status is RunStatus.COMPLETED
-    # Sequential execution of two 0.15s tasks would take >=0.30s; concurrent
-    # execution should land close to one delay plus overhead.
-    assert elapsed < delay * 2, f"left/right did not run concurrently ({elapsed:.3f}s)"
+    # Interval overlap, not a wall-clock threshold: robust under CPU
+    # contention or a loaded machine, where a fixed "elapsed < N seconds"
+    # assertion would be flaky in either direction.
+    assert left.overlaps(right), (
+        f"left [{left.started_at}, {left.finished_at}] and right "
+        f"[{right.started_at}, {right.finished_at}] did not overlap - not concurrent"
+    )
 
 
 @pytest.mark.parametrize("join", [JoinPolicy.ALL, JoinPolicy.ANY])

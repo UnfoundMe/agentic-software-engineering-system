@@ -33,12 +33,13 @@ def make_event(
     *,
     node_id: str | None = None,
     attempt: int | None = None,
+    actor: Actor | None = None,
     **payload: object,
 ) -> UnsealedEvent:
     return UnsealedEvent(
         run_id=run_id,
         type=event_type,
-        actor=Actor.kernel(),
+        actor=actor or Actor.kernel(),
         node_id=node_id,
         attempt=attempt,
         payload=payload,

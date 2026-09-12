@@ -169,8 +169,7 @@ class Scheduler:
             return state  # resuming a finished run is a no-op, not an error
 
         try:
-            if state.status is RunStatus.CREATED:
-                await self._emit(EventType.RUN_STARTED, workflow=self.graph.name)
+            await self._ensure_started()
 
             while True:
                 self.cancel_token.raise_if_cancelled()
@@ -206,10 +205,28 @@ class Scheduler:
         state = await resume(self.store, run_id, checkpoints=self.checkpoints)
         self._run_id = run_id
         self._state = state
-        if state.status is RunStatus.CREATED:
-            await self._emit(EventType.RUN_STARTED, workflow=self.graph.name)
+        await self._ensure_started()
         await self._step()
         return state
+
+    async def _ensure_started(self) -> None:
+        """Emit `RUN_CREATED` (carrying the workflow name) exactly once, for
+        a run that has no events at all yet, then `RUN_STARTED`.
+
+        Split from a single `RUN_STARTED` because `kernel.state`'s fold reads
+        `workflow` only from `RUN_CREATED` - a run driven purely by repeated
+        `Scheduler.run()` calls with no separate "create the run" step ahead
+        of it would otherwise never have its workflow name recorded at all.
+        A run whose creation was already recorded by an external caller
+        (`last_seq > 0`, status still CREATED) only gets `RUN_STARTED` here,
+        not a second `RUN_CREATED`.
+        """
+        assert self._state is not None
+        if self._state.status is not RunStatus.CREATED:
+            return
+        if self._state.last_seq == 0:
+            await self._emit(EventType.RUN_CREATED, workflow=self.graph.name)
+        await self._emit(EventType.RUN_STARTED)
 
     # -- readiness --------------------------------------------------------
 

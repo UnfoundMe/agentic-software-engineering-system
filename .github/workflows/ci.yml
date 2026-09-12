@@ -70,8 +70,14 @@ jobs:
       - name: Migrate
         run: uv run ases db upgrade
 
-      - name: Test
+      - name: Test (unit + invariants)
+        # Integration tests are excluded by default (pyproject.toml's
+        # addopts) so this step needs no live Postgres beyond what bootstrap
+        # already required above - it is a plain default `pytest` run.
         run: uv run pytest --cov --cov-report=xml
+
+      - name: Test (integration, against this job's Postgres service)
+        run: uv run pytest -m integration
 
       - name: Invariants
         # Each test attempts to violate an architectural rule and asserts the
