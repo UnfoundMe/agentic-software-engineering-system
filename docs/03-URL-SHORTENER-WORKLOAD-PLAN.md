@@ -1,6 +1,6 @@
 # Plan 2 of 2 — URL Shortener, Implemented *by* the Orchestrator
 
-**System:** `url-shortener` (ASP.NET Core 9 / C# / PostgreSQL / Redis)
+**System:** `url-shortener` (ASP.NET Core 10 / C# / PostgreSQL / Redis)
 **Status:** Proposed
 **Date:** 2026-09-12
 **Companion:** `02-ORCHESTRATOR-IMPLEMENTATION-PLAN.md`
@@ -48,7 +48,7 @@ After Run 1 the output is **frozen and committed** to `workloads/url-shortener/b
 
 ### 3.1 Requirement text given to the orchestrator
 
-> Build a URL shortening service as an ASP.NET Core 9 Web API targeting .NET 9, backed by PostgreSQL via Entity Framework Core.
+> Build a URL shortening service as an ASP.NET Core 10 Web API targeting .NET 10, backed by PostgreSQL via Entity Framework Core.
 >
 > It must expose:
 > - `POST /api/v1/urls` accepting `{"url": "<absolute http/https url>"}`, returning `201 Created` with `{"code": "<base62>", "shortUrl": "<absolute url>"}`
@@ -58,6 +58,32 @@ After Run 1 the output is **frozen and committed** to `workloads/url-shortener/b
 > Short codes must be Base62, collision-free, and at most 10 characters. URL mappings must be durably persisted. Invalid input must return `400` using RFC 7807 Problem Details. Provide unit and integration tests.
 
 The contract is stated *in the requirement* rather than assumed, which keeps generation objective without pre-writing any implementation.
+
+### 3.1a Standing architecture constraint (all runs, from `claude.md` §9)
+
+`claude.md` prescribes a four-layer separation for the URL Shortener:
+
+- **Domain** — business rules only. Must not depend on ASP.NET Core, EF Core,
+  PostgreSQL, Redis, the orchestrator, or any LLM provider.
+- **Application** — use cases (create, resolve, analytics, expiration) plus
+  the interfaces Infrastructure implements.
+- **Infrastructure** — PostgreSQL, Redis, short-code generation, analytics
+  persistence, security adapters.
+- **API** — thin controllers: HTTP → Application → Domain/Infrastructure → HTTP.
+
+**This is given to the Architect agent as an explicit constraint, not held back
+as a hidden grading detail.** It is included in every `ARCH_DESIGN` prompt
+regardless of run, and `DesignSpec` must state how the chosen project structure
+satisfies it.
+
+**It is guidance, not an enforced gate — a deliberate choice, not an oversight.**
+No static check parses `.csproj` references to verify the layering, and no exit
+gate fails a task for violating it. `CODE_REVIEW` (the LLM critic, §4) is asked
+to flag a violation it notices, but that is advisory like every other L4
+finding, not authoritative like L1–L3. A future revision could add a cheap
+`.csproj`-reference fitness check without touching the deferred Roslyn work —
+Stage 2's semantic analysis and a Stage-1-appropriate XML-parsing check are
+different things — but that is not built now.
 
 ### 3.2 Ambiguities the Requirements Agent is expected to surface at Gate 1
 
@@ -93,15 +119,24 @@ Expected parallelism: a plausible decomposition yields independent tasks for the
 
 `SCAFFOLD` exists because parallelism is what creates integration risk: without frozen interfaces, two tasks can each compile alone and fail together at the barrier. Freezing the contract before fan-out removes that class of failure. See `02` §7.1.
 
-### 3.4 Reference architecture — **grading oracle only**
+### 3.4 Reference file layout — **grading oracle only; layer separation itself is §3.1a, not this**
 
-Recorded here so the output can be assessed against a considered target. **It is never placed in an agent's context**; if an agent converges on something materially different but passes the contract and the oracle, that is a legitimate outcome and the divergence is recorded rather than penalised.
+The four-layer *separation* (Domain / Application / Infrastructure / API) is a
+standing constraint given to the agent per §3.1a. What follows is a finer-grained
+**illustrative** file layout recorded only so output can be assessed against a
+considered target. **It is never placed in an agent's context**; if an agent
+converges on a different but still-layered structure that passes the contract
+and the oracle, that is a legitimate outcome and the divergence is recorded
+rather than penalised. `UrlShortener.Core` below folds Domain and Application
+into one project for brevity — an agent that keeps them separate, as §3.1a's
+wording more literally suggests, is equally acceptable.
 
 ```
 UrlShortener.sln
-  src/UrlShortener.Api/             endpoints, DI wiring, Problem Details
-  src/UrlShortener.Core/            ShortUrl entity, Base62 encoder, abstractions
-  src/UrlShortener.Infrastructure/  EF Core DbContext, repository, migrations
+  src/UrlShortener.Domain/          ShortUrl entity, Base62 encoder — zero infra deps
+  src/UrlShortener.Application/     use cases (create, resolve) + repository interfaces
+  src/UrlShortener.Infrastructure/  EF Core DbContext, repository impl, migrations
+  src/UrlShortener.Api/             thin controllers, DI wiring, Problem Details
   tests/UrlShortener.Tests/         unit + integration
 ```
 

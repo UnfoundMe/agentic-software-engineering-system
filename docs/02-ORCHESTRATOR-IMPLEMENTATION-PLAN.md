@@ -129,7 +129,7 @@ Dependency note: phases are sequential except **6 and 7, which may proceed in pa
 
 ### Phase 0 — Foundation & contracts
 
-- `git init`; repo scaffold; `orchestrator/` and `workloads/` boundaries created empty
+- `git init`; repo scaffold; `src/orchestrator/`, `src/url-shortener/` and `workloads/` boundaries created empty
 - Python project: `uv`, `ruff`, `mypy --strict`, `pytest`, `pytest-asyncio`
 - `infra/docker-compose.yml`: Postgres 16 + Redis 7. **One database, two schemas, two roles** — `control` (owner `ases_control`) and `workload_test` (owner `workload_app`), with grants and resource limits per `04-DATA-AND-MIGRATION-STRATEGY.md` §1
 - Control-plane schema via **Alembic**: `runs`, `events`, `artifacts`, `lineage`, `approvals`, `policy_violations`. `events` made append-only by both privilege revocation and a `BEFORE UPDATE OR DELETE` trigger; `prev_hash` unique
@@ -216,7 +216,7 @@ Dependency note: phases are sequential except **6 and 7, which may proceed in pa
 
 > Out of scope until the greenfield path is solid. Retained here so the interface seam is designed for now and built later: `codebase/` sits behind a `CodebaseAnalyzer` protocol that the graph depends on, so Stage 2 is a plug-in rather than a retrofit. `GROUND_TRUTH.md` is deferred with it, since it can only be authored against the frozen baseline that Phase 4 produces.
 
-- `tools/RoslynIndexer/` — .NET 9 console app using `Microsoft.CodeAnalysis.CSharp`, JSON over stdio
+- `tools/RoslynIndexer/` — .NET 10 console app using `Microsoft.CodeAnalysis.CSharp`, JSON over stdio
 - Python `roslyn_client.py` with a versioned JSON contract and a schema-validated response
 - Symbol table; project/assembly reference graph; type and member index
 - API map: ASP.NET Core attribute routing **and** minimal-API endpoint registration
@@ -305,7 +305,7 @@ The realistic failure modes are mundane rather than dramatic:
 | Mode | Cause | Addressed by |
 |---|---|---|
 | **Interface drift across parallel tasks** — the largest by far | Task A defines `IUrlRepository`, task B consumes an assumed signature; each compiles alone, integration fails at the barrier | `SCAFFOLD` node freezes interfaces before fan-out |
-| Hallucinated APIs or package versions | Training data vs. .NET 9 / EF Core 9 specifics | Pinned Central Package Management + a `dotnet restore` probe in `SCAFFOLD` |
+| Hallucinated APIs or package versions | Training data vs. .NET 10 / EF Core 10 specifics | Pinned Central Package Management + a `dotnet restore` probe in `SCAFFOLD` |
 | Nullable-reference warnings under `-warnaserror` | CS8618 and friends are endemic in generated C# | Compiler diagnostics fed back verbatim to `REPAIR` |
 | Missing `ProjectReference` or DI registration | Compiles, fails at runtime | `SCAFFOLD` owns project wiring; integration tests catch DI |
 

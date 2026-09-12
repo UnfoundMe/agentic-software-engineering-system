@@ -80,7 +80,12 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers"
+# Integration tests are opt-in (`-m integration`) because they need a live
+# Postgres (`scripts/dev-up.sh` first) - excluded by default so the ordinary
+# inner loop (`uv run pytest`) never fails purely because no database is
+# running. CI runs both: the default set, then a separate `-m integration`
+# pass once its Postgres service is confirmed up.
+addopts = "-ra --strict-markers -m \"not integration\""
 markers = [
     "integration: requires Postgres (run scripts/dev-up first)",
     "invariant: asserts an architectural rule cannot be violated",

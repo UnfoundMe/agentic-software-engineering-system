@@ -90,7 +90,7 @@ The base plan's stated reviewer property was "clone, run, get identical results,
 Phase 9 adds OpenTelemetry and a Grafana dashboard; the agreed interface decision was a custom local dashboard. These do not overlap: Grafana cannot render a live DAG, an approval queue, or a lineage inspector; a hand-built dashboard should not be reimplementing metric storage and time-series panels. → §5 Q3.
 
 **C5 — Where does the .NET toolchain execute?**
-If the orchestrator runs inside a container, that image needs the .NET 9 SDK (~800MB) plus NuGet cache. **Recommendation:** run the orchestrator on the host (Python 3.13 and .NET 9.0.201 are both already installed here) and use Docker Compose *only* for Postgres, Redis and Grafana. Simpler, faster inner loop, and it keeps the sandbox's `dotnet build` fast. Flagging rather than assuming.
+If the orchestrator runs inside a container, that image needs the .NET 10 SDK (~800MB) plus NuGet cache. **Recommendation:** run the orchestrator on the host (Python 3.13 and .NET 10 are both installed here) and use Docker Compose *only* for Postgres, Redis and Grafana. Simpler, faster inner loop, and it keeps the sandbox's `dotnet build` fast. Flagging rather than assuming.
 
 **C6 — "URL safety checks" (Phase 4) implies an external network dependency** (e.g. a Safe Browsing API). That breaks offline determinism and introduces an un-mockable external side effect. **Recommendation:** implement as a local denylist plus a pluggable `SafetyProvider` interface, with the remote implementation stubbed. Keeps the seam visible without the dependency.
 

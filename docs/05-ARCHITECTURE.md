@@ -420,6 +420,24 @@ treated rollback as one mechanism. Sandbox rollback is total and free; external
 compensation is partial and ordered. Conflating them produces a rollback that
 silently does not roll back.
 
+**Implemented today (kernel/scheduler.py), narrower than the table above:**
+graph-level `ON_FAILURE` cycles (a workflow author's own repair loop) and
+cycle-budget safe-stop both work now; the tool-level idempotency
+classification and external-effect compensation in rows 1–3 are Phase 5, not
+built yet. Getting the *readiness* mechanism correct here turned out to be
+harder than it looked: a node's join is checked against its predecessors'
+*current* status, and a predecessor that succeeds is permanently in that
+status afterwards. Left unguarded, that makes every downstream node eligible
+to re-run forever the moment the run doesn't finish in a single pass - not a
+rare case, the default case for anything with a human gate. The fix
+(`_propagate_edge_completion`, `_DIRECTLY_ELIGIBLE_STATUSES` in that module)
+makes SUCCEEDED/FAILED→STALE/RETRYING an explicit, one-shot transition fired
+by the predecessor's own completion, never inferred by re-scanning status -
+the same mechanism now runs both the repair loop and the one-hop
+clarification-rejection cycle described in section 4.2. Caught by
+`tests/unit/test_scheduler.py`, which hung outright on the simplest possible
+linear case before the fix - worth knowing if you extend readiness logic here.
+
 ---
 
 ## 6. Runtime sequence — a greenfield run

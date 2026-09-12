@@ -22,8 +22,21 @@ PACKAGE_ROOT = Path(ases.__file__).parent
 KERNEL_ROOT = PACKAGE_ROOT / "kernel"
 
 #: Packages the kernel must never reach into. Each would let a non-deterministic
-#: or outward-facing concern influence control flow.
-FORBIDDEN_FOR_KERNEL = ("agents", "providers", "codebase", "validation", "interfaces", "sandbox")
+#: or outward-facing concern influence control flow. Matches docs/05 section 2's
+#: layering diagram: kernel/ sits below context/, providers/, sandbox/ and
+#: observability/, not beside or above them - lineage, for instance, is built
+#: *from* a fold (context/lineage.py imports kernel.state) and must never be
+#: a dependency the fold itself needs.
+FORBIDDEN_FOR_KERNEL = (
+    "agents",
+    "providers",
+    "codebase",
+    "validation",
+    "interfaces",
+    "sandbox",
+    "context",
+    "observability",
+)
 
 #: Third-party modules that would indicate an LLM call from inside the kernel.
 FORBIDDEN_THIRD_PARTY = ("anthropic", "openai", "httpx", "requests")
