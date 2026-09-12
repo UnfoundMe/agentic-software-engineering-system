@@ -16,6 +16,15 @@ on commit or rollback. This is the one property `JsonlEventStore`'s in-process
 `asyncio.Lock` cannot provide and this store must: two separate *processes*
 (two orchestrator workers, or a crashed-and-restarted one racing its own
 successor) appending to the same run must not fork the chain either.
+
+Schema guard: docs/02 Phase 0 requires that startup refuses to run if the
+applied Alembic revision does not match what this codebase expects. Checked
+once per store instance, on first real use, against `control.alembic_version`
+- not in `__init__`, which cannot be async. A codebase whose migrations moved
+on without the database (or the reverse) is a codebase that does not actually
+know what `control.events` looks like right now; proceeding on that basis is
+exactly the "operate against a schema it doesn't understand" failure this
+exists to rule out.
 """
 
 from __future__ import annotations
@@ -24,12 +33,35 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
 
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from ases.config import REPO_ROOT
 from ases.kernel.events import Actor, ChainVerification, Event, UnsealedEvent
 from ases.kernel.hashing import GENESIS_HASH
 from ases.kernel.store.base import ChainForkError, EventStoreError, verify_sequence
+
+
+class SchemaVersionMismatchError(EventStoreError):
+    """The database's applied Alembic revision does not match what this
+    codebase's migrations expect, or no revision is recorded at all. Refuses
+    to proceed rather than operate against a schema it cannot account for -
+    run `ases db upgrade`."""
+
+
+def _expected_head() -> str:
+    """The revision this codebase's migrations converge on, per
+    `src/orchestrator/ases/migrations/versions/`. Independent of any live
+    database - a pure function of what is checked into the repository."""
+    cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "src/orchestrator/ases/migrations"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    if head is None:
+        raise SchemaVersionMismatchError("no migrations found in the script directory")
+    return head
 
 
 def _advisory_lock_key(run_id: UUID) -> int:
@@ -75,9 +107,34 @@ class PostgresEventStore:
 
     def __init__(self, dsn: str) -> None:
         self._engine: AsyncEngine = create_async_engine(dsn, pool_pre_ping=True)
+        self._schema_verified = False
 
     async def close(self) -> None:
         await self._engine.dispose()
+
+    async def _ensure_schema_verified(self) -> None:
+        """Checked once per instance, then cached - not on every call, which
+        would add a round-trip to every single append and read."""
+        if self._schema_verified:
+            return
+        expected = _expected_head()
+        async with self._engine.connect() as conn:
+            try:
+                row = (
+                    await conn.execute(text("SELECT version_num FROM control.alembic_version"))
+                ).first()
+            except DBAPIError as exc:
+                raise SchemaVersionMismatchError(
+                    "could not read control.alembic_version - has 'ases db upgrade' "
+                    f"been run against this database? ({exc})"
+                ) from exc
+        applied = row.version_num if row else None
+        if applied != expected:
+            raise SchemaVersionMismatchError(
+                f"database schema is at {applied!r}, this codebase expects {expected!r} "
+                "- run 'ases db upgrade' before continuing"
+            )
+        self._schema_verified = True
 
     # -- writing ---------------------------------------------------------
 
@@ -88,6 +145,7 @@ class PostgresEventStore:
     async def append_all(self, events: Sequence[UnsealedEvent]) -> tuple[Event, ...]:
         if not events:
             return ()
+        await self._ensure_schema_verified()
         run_ids = {e.run_id for e in events}
         if len(run_ids) != 1:
             raise EventStoreError("append_all requires all events to share one run_id")
@@ -168,6 +226,7 @@ class PostgresEventStore:
                 yield event
 
     async def read_all(self, run_id: UUID) -> tuple[Event, ...]:
+        await self._ensure_schema_verified()
         async with self._engine.connect() as conn:
             rows = (
                 await conn.execute(
@@ -191,6 +250,7 @@ class PostgresEventStore:
         return verify_sequence(run_id, await self.read_all(run_id))
 
     async def list_runs(self) -> tuple[UUID, ...]:
+        await self._ensure_schema_verified()
         async with self._engine.connect() as conn:
             rows = (await conn.execute(text("SELECT DISTINCT run_id FROM control.events"))).all()
         return tuple(row.run_id for row in rows)

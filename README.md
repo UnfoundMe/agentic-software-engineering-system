@@ -3,7 +3,7 @@
 A governed orchestration kernel that drives LLM agents through the full SDLC,
 turning one natural-language requirement into a reviewable engineering outcome.
 
-> **Status: Phase 0 and Phase 1 complete.** Phase 2 (LLM boundary) not started.
+> **Status: Phase 0 and Phase 1 fully complete.** Phase 2 (LLM boundary) not started.
 >
 > | Area | State |
 > |---|---|
@@ -19,7 +19,7 @@ turning one natural-language requirement into a reviewable engineering outcome.
 > | Policy packs (Phase 3), agents/providers/sandbox/dashboard (Phase 2+) | not started, by design — see docs/02 |
 > | Dynamic subgraph admission wired into a live run; full re-planning (Phase 7) | not started — see `kernel/scheduler.py`'s module docstring for the exact boundary |
 >
-> 184 tests (unit + integration + invariants), mypy `--strict`, ruff clean.
+> 186 tests (unit + integration + invariants), mypy `--strict`, ruff clean.
 > `./scripts/dev-up.sh` now works end to end - see
 > [`docs/06-VALIDATION-GUIDE.md`](docs/06-VALIDATION-GUIDE.md) to reproduce
 > and cross-check everything above yourself.

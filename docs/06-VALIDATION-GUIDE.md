@@ -260,7 +260,52 @@ docker start ases-postgres
 
 ---
 
-## 6. What this does *not* yet prove
+## 6. Prove the schema-version guard yourself
+
+docs/02 Phase 0 requires that startup refuses to run if the database's
+applied Alembic revision doesn't match what the code expects. This is
+`PostgresEventStore._ensure_schema_verified`, checked once per store instance
+against `control.alembic_version`.
+
+```bash
+PW=<value of POSTGRES_SUPERUSER_PASSWORD in .env>
+docker exec -e PGPASSWORD="$PW" ases-postgres psql -h localhost -U ases_su -d ases \
+  -c "UPDATE control.alembic_version SET version_num = 'not-a-real-revision';"
+
+uv run ases export 00000000-0000-0000-0000-000000000000
+```
+
+**Expect:** a `SchemaVersionMismatchError` naming both the value found and the
+value expected, and telling you to run `ases db upgrade`.
+
+**Restore it** - directly, not via `ases db upgrade`. That command computes an
+upgrade *path* from the currently-recorded revision to head; a deliberately
+nonsense value like the one above isn't a real prior revision for it to path
+from, so it correctly refuses too (`Can't locate revision identified by
+'not-a-real-revision'`). For a *realistic* stale-database scenario - the
+recorded revision is real, just behind head - `ases db upgrade` is exactly the
+right fix and works normally; this manual test only reaches the artificial
+"unrecoverable" case because it corrupts the value to something that never
+existed, which a real migration lag never does.
+
+```bash
+docker exec -e PGPASSWORD="$PW" ases-postgres psql -h localhost -U ases_su -d ases \
+  -c "UPDATE control.alembic_version SET version_num = '2fb5dbe21d8d';"
+uv run ases export 00000000-0000-0000-0000-000000000000
+```
+
+**Expect:** `no events found for run ...` - the schema check passes silently
+and you reach the next, unrelated error (there's no such run), confirming
+recovery.
+
+The automated version of all of this - including the realistic "no version
+recorded at all" case (`ases db bootstrap` ran, `ases db upgrade` never did) -
+is `tests/integration/test_store_postgres.py::test_schema_guard_refuses_a_stale_database`
+and `::test_schema_guard_refuses_when_no_version_is_recorded`.
+
+---
+
+## 7. What this does *not* yet prove
 
 Read alongside the above, not instead of it:
 

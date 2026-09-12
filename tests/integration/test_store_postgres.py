@@ -20,7 +20,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from ases.config import settings
 from ases.kernel.events import Actor, EventType
 from ases.kernel.hashing import GENESIS_HASH
-from ases.kernel.store.postgres import PostgresEventStore
+from ases.kernel.store.postgres import (
+    PostgresEventStore,
+    SchemaVersionMismatchError,
+    _expected_head,
+)
 from tests.conftest import make_event
 
 pytestmark = pytest.mark.integration
@@ -160,6 +164,75 @@ async def test_ases_app_cannot_update_or_delete_events() -> None:
                 await conn.execute(text("DELETE FROM control.events"))
     finally:
         await engine.dispose()
+
+
+async def test_schema_guard_passes_against_a_correctly_migrated_database(
+    pg_store: PostgresEventStore, run_id: UUID
+) -> None:
+    """The happy path, made explicit rather than merely implied by every
+    other test in this file succeeding: this is docs/02 Phase 0's "startup
+    refuses to run if the Alembic head does not match" requirement, and its
+    positive case deserves its own name."""
+    await pg_store.append(make_event(run_id, EventType.RUN_CREATED, workflow="greenfield"))
+    assert pg_store._schema_verified is True
+
+
+async def test_schema_guard_refuses_a_stale_database(run_id: UUID) -> None:
+    """Simulates the real scenario this guard exists for: code has migrations
+    the database has not applied yet (or the reverse). Flips
+    `control.alembic_version` to a bogus value, proves every entry point
+    refuses to proceed, then restores the real value - `alembic_version` has
+    no append-only trigger, unlike `events`, so this is a plain UPDATE."""
+    su_engine = create_async_engine(settings().superuser_dsn)
+    real_head = _expected_head()
+    try:
+        async with su_engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE control.alembic_version SET version_num = 'not-a-real-revision'")
+            )
+
+        store = PostgresEventStore(settings().app_dsn)
+        try:
+            with pytest.raises(SchemaVersionMismatchError, match="not-a-real-revision"):
+                await store.append(make_event(run_id, EventType.RUN_CREATED))
+            # A second, independent store instance - the check is per
+            # instance, not process-global - must refuse identically.
+            with pytest.raises(SchemaVersionMismatchError):
+                await store.read_all(run_id)
+        finally:
+            await store.close()
+    finally:
+        async with su_engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE control.alembic_version SET version_num = :head"), {"head": real_head}
+            )
+        await su_engine.dispose()
+
+
+async def test_schema_guard_refuses_when_no_version_is_recorded(run_id: UUID) -> None:
+    """The other real scenario: `alembic_version` exists but is empty - the
+    same state the database would be in if `ases db upgrade` were never run
+    (deleting the row rather than dropping the table itself, since recreating
+    Alembic's own bookkeeping table by hand isn't this test's job)."""
+    su_engine = create_async_engine(settings().superuser_dsn)
+    real_head = _expected_head()
+    try:
+        async with su_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM control.alembic_version"))
+
+        store = PostgresEventStore(settings().app_dsn)
+        try:
+            with pytest.raises(SchemaVersionMismatchError, match="ases db upgrade"):
+                await store.append(make_event(run_id, EventType.RUN_CREATED))
+        finally:
+            await store.close()
+    finally:
+        async with su_engine.begin() as conn:
+            await conn.execute(
+                text("INSERT INTO control.alembic_version (version_num) VALUES (:head)"),
+                {"head": real_head},
+            )
+        await su_engine.dispose()
 
 
 async def test_workload_app_cannot_see_the_control_schema() -> None:
