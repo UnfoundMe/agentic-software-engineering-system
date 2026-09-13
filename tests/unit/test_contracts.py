@@ -16,7 +16,7 @@ WORKFLOWS_DIR = Path(ases.__file__).parent / "workflows"
 
 @pytest.mark.parametrize("kind", sorted(CONTRACTS))
 def test_every_contract_has_a_valid_schema(kind: str) -> None:
-    """A structural smoke test across all fourteen contracts: the model
+    """A structural smoke test across every contract: the model
     definition itself must be sound (no bad type hints, no circular refs)
     even before any agent exists to populate one."""
     model = CONTRACTS[kind]

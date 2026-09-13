@@ -22,7 +22,7 @@ from typing import Any, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ases.kernel.state import NodeStatus
+from ases.kernel.state import TERMINAL_STATUSES, NodeStatus
 
 
 class GraphError(ValueError):
@@ -55,7 +55,36 @@ class EdgeCondition(StrEnum):
     def matches(self, status: NodeStatus) -> bool:
         match self:
             case EdgeCondition.ALWAYS:
-                return True
+                # "Always" means "regardless of which outcome the source
+                # reached" - the union of every other condition's match set -
+                # never "regardless of whether the source has run at all".
+                # A literal `True` here was a real bug, found via
+                # `test_greenfield_full_e2e.py`: combined with `join: any`,
+                # it made a node with an `always`-conditioned incoming edge
+                # from a *not-yet-run* predecessor (still at its default
+                # `PENDING`) immediately "ready", regardless of its other,
+                # real predecessor's progress - `test_run`'s dormant
+                # `repair -[always]-> test_run` edge fired before `test_gen`
+                # (its actual, intended predecessor) ever ran. Masked in the
+                # one existing test of this edge shape
+                # (`test_scheduler.py::_repair_graph`) because there the
+                # affected node is the graph's *entry point*, which bypasses
+                # join checking entirely on its first pass.
+                #
+                # The match set is every other condition's set, plus
+                # `TERMINAL_STATUSES` (a cancelled/skipped/halted node also
+                # reached a definitive outcome, just not one any `ON_*`
+                # condition names) - deliberately still excluding
+                # `PENDING`/`READY`/`RUNNING`/every other in-flight or
+                # not-yet-started status.
+                return status in TERMINAL_STATUSES or status in (
+                    NodeStatus.SUCCEEDED,
+                    NodeStatus.FAILED,
+                    NodeStatus.ROLLED_BACK,
+                    NodeStatus.FALLBACK,
+                    NodeStatus.REJECTED,
+                    NodeStatus.STALE,
+                )
             case EdgeCondition.ON_SUCCESS:
                 return status is NodeStatus.SUCCEEDED
             case EdgeCondition.ON_FAILURE:

@@ -88,27 +88,41 @@ class NodeExecutor(Protocol):
 
 
 #: Statuses the generic readiness scan may pick up directly. Deliberately
-#: **excludes** SUCCEEDED and FAILED, even though the state machine permits
-#: SUCCEEDED->STALE and FAILED->RETRYING - because both of those predecessor
-#: statuses are "sticky": once reached, they never change again on their own,
-#: so a join check against a permanently-succeeded (or -failed) predecessor
-#: would stay satisfied forever. A generic scan that treated them as
-#: re-eligible would restart the node on every subsequent pass for as long as
-#: the run stays open for any other reason - not a rare edge case, but the
-#: guaranteed outcome for a repair loop or a clarification cycle followed by
-#: anything that keeps the run from completing in the same pass. That was
-#: exactly the shape of the first bug found while testing this scheduler:
-#: `test_linear_run_with_granted_approval_completes` hung outright, and
-#: several other tests silently reached the right answer by accident because
-#: the run happened to complete before a second, spurious pass could run.
+#: **excludes** SUCCEEDED, FAILED and REJECTED, even though the state machine
+#: permits SUCCEEDED->STALE, FAILED->RETRYING and REJECTED->RETRYING -
+#: because all three of those predecessor/self statuses are "sticky": once
+#: reached, they never change again on their own, so a join check against a
+#: permanently-settled predecessor would stay satisfied forever. A generic
+#: scan that treated them as re-eligible would restart the node on every
+#: subsequent pass for as long as the run stays open for any other reason -
+#: not a rare edge case, but the guaranteed outcome for a repair loop or a
+#: clarification cycle followed by anything that keeps the run from
+#: completing in the same pass. That was exactly the shape of the first bug
+#: found while testing this scheduler: `test_linear_run_with_granted_approval_completes`
+#: hung outright, and several other tests silently reached the right answer
+#: by accident because the run happened to complete before a second, spurious
+#: pass could run.
 #:
-#: The fix: SUCCEEDED and FAILED nodes are moved to STALE/RETRYING **only**
-#: by the explicit, one-shot `_propagate_edge_completion` below, called right
-#: when a predecessor settles - never inferred by scanning current status.
+#: REJECTED joined this exclusion later than the other two, found the same
+#: way: a gate rejected with no `on_rejected` recovery edge (or whose
+#: producer had not yet re-settled) stayed "sticky-eligible" against its own
+#: permanently-succeeded predecessor, so the next pass re-dispatched the
+#: *gate itself* - re-requesting an approval nobody asked for again, and if
+#: no further decision was scripted/available, silently overwriting the
+#: rejection's own `ApprovalRecord` (actor, reason) with the blank
+#: placeholder `APPROVAL_REQUESTED` sets, corrupting the audit trail of what
+#: a human actually decided. `test_greenfield_partial_e2e.py`'s rejection
+#: test caught it - a scenario the original clarification-cycle test never
+#: exercised, since it always scripted a second, eventually-approving
+#: decision and never inspected the intermediate approval record's contents.
+#:
+#: The fix: SUCCEEDED, FAILED and REJECTED nodes are moved to
+#: STALE/RETRYING/RETRYING (respectively) **only** by the explicit, one-shot
+#: `_propagate_edge_completion` below, called right when a predecessor
+#: settles - never inferred by scanning current status.
 _DIRECTLY_ELIGIBLE_STATUSES = frozenset(
     {
         NodeStatus.PENDING,
-        NodeStatus.REJECTED,
         NodeStatus.RETRYING,
         NodeStatus.STALE,
         NodeStatus.BLOCKED,
@@ -118,6 +132,37 @@ _DIRECTLY_ELIGIBLE_STATUSES = frozenset(
 
 def _is_directly_eligible(status: NodeStatus) -> bool:
     return status in _DIRECTLY_ELIGIBLE_STATUSES and NodeStatus.READY in LEGAL_TRANSITIONS[status]
+
+
+#: A predecessor in one of these statuses has reached a genuine, final
+#: outcome for its current attempt - not merely "not running right now"
+#: (`AWAITING_APPROVAL`, `STALE` and `RETRYING` are deliberately excluded:
+#: each is specifically designed to be reconsidered). Used by
+#: `Scheduler._is_permanently_unreachable` below. Deliberately **not** a
+#: transitive-closure computation over `LEGAL_TRANSITIONS`: the abstract
+#: state machine permits long chains of legal transitions that will never
+#: actually happen without a real, separately-triggered event (an early,
+#: broader version of this check treated the mere existence of *some* legal
+#: path to a matching status as "might still fire", which made nearly every
+#: node "possibly reachable" forever - the state machine describes what
+#: transitions are *permitted*, not what will spontaneously occur). The
+#: right question is narrower: once a node settles here,
+#: `_propagate_edge_completion` has already had its one synchronous shot at
+#: firing every matching outgoing edge; if a given edge didn't match then, it
+#: will not later, absent a new, separately-triggered event this check would
+#: see reflected in a *different* status by the time it runs again.
+_FINAL_OUTCOME_STATUSES = frozenset(
+    {
+        NodeStatus.SUCCEEDED,
+        NodeStatus.FAILED,
+        NodeStatus.REJECTED,
+        NodeStatus.CANCELLED,
+        NodeStatus.SKIPPED,
+        NodeStatus.HALTED,
+        NodeStatus.ROLLED_BACK,
+        NodeStatus.FALLBACK,
+    }
+)
 
 
 def _handler_of(node: NodeSpec) -> str:
@@ -184,6 +229,26 @@ class Scheduler:
                     await self._emit(EventType.RUN_COMPLETED)
                     break
                 if not progressed:
+                    if not self._awaiting_human_decision():
+                        # Genuinely stuck, not just paused: nothing is ready,
+                        # nothing is waiting on a human who might still answer,
+                        # and the run is not complete - a rejected gate with no
+                        # `on_rejected` edge is the common cause (found via a
+                        # live run: rejecting a gate with no such edge left
+                        # `state.status` silently stuck at RUNNING forever,
+                        # since neither RUN_COMPLETED nor any failure event
+                        # was ever emitted for it). A later `run()` call on
+                        # this same run_id cannot change this outcome either,
+                        # unlike the awaiting-approval case below.
+                        await self._emit(
+                            EventType.RUN_FAILED,
+                            reason=(
+                                "the run is stuck: no node is ready, none are "
+                                "awaiting a human decision, and the run has not "
+                                "completed - likely a rejected gate or barrier "
+                                "with no recovery edge from here"
+                            ),
+                        )
                     break  # quiescent: awaiting a human, or nothing left ready
                 if self.checkpoints is not None:
                     await self.checkpoints.save(
@@ -286,7 +351,30 @@ class Scheduler:
         raise AssertionError(f"unhandled join policy {join}")  # pragma: no cover
 
     def _has_recovery_edge(self, node_id: str) -> bool:
-        return any(e.condition is EdgeCondition.ON_FAILURE for e in self.graph.successors(node_id))
+        """True if some successor edge will act on `node_id` failing - either
+        an explicit `ON_FAILURE` edge, or an `ALWAYS` edge, which (per
+        `EdgeCondition.matches`) fires on failure too, since "always" is the
+        union of every other condition's match set.
+
+        Found by reasoning about `workflows/greenfield.yaml`'s own
+        `repair`/`repair_domain`/`repair_api` nodes: each has exactly one
+        outgoing edge, `condition: always`, back to the node it is repairing -
+        never `on_failure`. Before this fix, a repair agent that itself
+        failed (an LLM/schema error, or a tool call refused for a reason
+        unrelated to what it was repairing) would have been reported as
+        having "no recovery edge" and immediately failed the whole run with
+        `RUN_FAILED` - even though `_propagate_edge_completion` had, moments
+        earlier in the very same call, already fired that `always` edge and
+        rescheduled its target for another attempt. Never triggered by a live
+        run (no repair agent has failed outright yet), but is exactly what
+        `kernel/tools/fs.py`'s shared-file conflict guard can now cause on
+        purpose - see `agents/implementer.py`'s bounded reconciliation retry -
+        so it had to be correct before that guard could rely on failing
+        gracefully instead of ending the run."""
+        return any(
+            e.condition in (EdgeCondition.ON_FAILURE, EdgeCondition.ALWAYS)
+            for e in self.graph.successors(node_id)
+        )
 
     def _latest_artifact(self, node_id: str) -> str:
         state_for_node = self._state.nodes.get(node_id) if self._state else None
@@ -495,7 +583,12 @@ class Scheduler:
             target_status = self._state.status_of(edge.target)
             if target_status is NodeStatus.SUCCEEDED:
                 await self._emit(EventType.NODE_MARKED_STALE, node_id=edge.target)
-            elif target_status is NodeStatus.FAILED:
+            elif target_status in (NodeStatus.FAILED, NodeStatus.REJECTED):
+                # A REJECTED gate's own producer just settled again (this is
+                # what makes the clarification cycle's second pass fire) -
+                # re-stage the gate itself, one-shot, exactly like a FAILED
+                # node's retry. See `_DIRECTLY_ELIGIBLE_STATUSES`'s docstring
+                # for the corrupted-approval-record bug this replaces.
                 await self._emit(EventType.NODE_RETRY_SCHEDULED, node_id=edge.target)
             # PENDING targets are already picked up by the normal scan; a
             # target that is currently in flight cannot be safely restaged
@@ -545,6 +638,15 @@ class Scheduler:
                 artifact_hash=artifact_hash,
                 kind=outcome.artifact_kind,
                 inputs=list(self._input_artifacts(node)),
+                # Full content, not just the hash - this is what lets a
+                # downstream node (or a human at an approval gate) actually
+                # read what a producing node made, via
+                # `context.retriever.ContextRetriever.fetch`. The event log
+                # remains the only place this is stored, consistent with
+                # "everything is derived from the event log" - no separate
+                # artifact store, no second place content could drift from
+                # what was actually produced.
+                content=dict(outcome.artifact_payload or {}),
             )
             await self._emit(
                 EventType.ARTIFACT_VALIDATED, node_id=node.id, artifact_hash=artifact_hash
@@ -562,10 +664,81 @@ class Scheduler:
 
     # -- completion ---------------------------------------------------------
 
+    def _awaiting_human_decision(self) -> bool:
+        """True while at least one node is `AWAITING_APPROVAL` - a later
+        `run()` call on this same run_id could still resolve it once a human
+        decides, so a quiescent step here must not be reported as a failure.
+        This is the one case `run()`'s stuck-detection must not fire on."""
+        assert self._state is not None
+        return any(
+            node.status is NodeStatus.AWAITING_APPROVAL for node in self._state.nodes.values()
+        )
+
     def _is_complete(self) -> bool:
         assert self._state is not None
         settled = (NodeStatus.SUCCEEDED, NodeStatus.SKIPPED, NodeStatus.CANCELLED)
-        return all(self._state.status_of(n.id) in settled for n in self.graph.nodes)
+        return all(
+            self._state.status_of(n.id) in settled or self._is_permanently_unreachable(n.id)
+            for n in self.graph.nodes
+        )
+
+    #: The two statuses `_is_permanently_unreachable` will actually evaluate -
+    #: see its own docstring for why `FAILED` joined `PENDING` here.
+    _UNREACHABILITY_CANDIDATE_STATUSES = frozenset({NodeStatus.PENDING, NodeStatus.FAILED})
+
+    def _is_permanently_unreachable(self, node_id: str) -> bool:
+        """A `PENDING` or `FAILED` node whose every incoming edge's source has
+        already settled into a final outcome (`_FINAL_OUTCOME_STATUSES`)
+        without that edge's condition matching - e.g. `repair`'s only edge is
+        `test_run -[on_failure]-> repair`, and this run's `test_run` already
+        `SUCCEEDED`. Such a node was a real, valid branch this run's actual
+        path simply never took (if `PENDING`) or took but did not settle
+        successfully on its one dispatched attempt (if `FAILED`) - either way
+        nothing can ever dispatch it again, and it must not block completion:
+        `_is_complete()` would otherwise wait forever for it.
+
+        Found via `test_greenfield_full_e2e.py`: no prior test had a graph
+        both large enough to contain a genuinely optional branch and
+        expected to reach `RUN_COMPLETED` rather than `HALTED`/`FAILED`, so
+        this was never exercised.
+
+        **`FAILED` joined `PENDING` here** while fixing `_has_recovery_edge`
+        to recognise an `ALWAYS` edge as recovery (see that method's own
+        docstring): `workflows/greenfield.yaml`'s `repair`/`repair_domain`/
+        `repair_api` each have exactly one outgoing edge, `condition:
+        always`, back to the node they repair - never a second edge back to
+        themselves. A repair agent that fails once (which
+        `agents/implementer.py`'s bounded reconciliation retry can now
+        legitimately do) settles at `FAILED` *permanently* - `LEGAL_TRANSITIONS`
+        only ever moves a `FAILED` node again via `_propagate_edge_completion`'s
+        one-shot restaging, and nothing targets `repair*` itself for a retry.
+        Before this, if the node it repaired then succeeded on its own
+        rescheduled attempt, `_is_complete()` would never see the *whole run*
+        as complete - `FAILED` is not in `settled`, and the old
+        `PENDING`-only guard here refused to even consider it - so the
+        scheduler would spin until the "nothing ready, nothing awaiting a
+        human" stuck-detection path in `run()` eventually reported
+        `RUN_FAILED` anyway, defeating the whole point of letting the repair
+        fail gracefully in the first place. Safe to evaluate here regardless
+        of *why* a node is `FAILED`: `_is_complete()` (and therefore this
+        method) is only ever reached while `state.status is RUNNING`, which
+        means every `FAILED` node still present necessarily had a recovery
+        edge when it failed - a `FAILED` node with none already ended the run
+        via `RUN_FAILED` before `_is_complete()` could ever run.
+        """
+        assert self._state is not None
+        if self._state.status_of(node_id) not in self._UNREACHABILITY_CANDIDATE_STATUSES:
+            return False
+        incoming = self.graph.predecessors(node_id)
+        if not incoming:
+            return False  # an entry node with no predecessors is reachable by definition
+        for edge in incoming:
+            source_status = self._state.status_of(edge.source)
+            if source_status not in _FINAL_OUTCOME_STATUSES:
+                return False  # predecessor hasn't settled yet - could still go either way
+            if edge.condition.matches(source_status):
+                return False  # this edge is satisfied; the node should already be ready
+        return True
 
     # -- event emission -------------------------------------------------
 

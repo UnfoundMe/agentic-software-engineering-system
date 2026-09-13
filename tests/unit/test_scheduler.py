@@ -88,6 +88,30 @@ async def test_linear_run_with_granted_approval_completes(
     assert len(state.artifacts) == 1
 
 
+async def test_artifact_content_is_recorded_alongside_its_hash(
+    store: JsonlEventStore, run_id: UUID
+) -> None:
+    """Phase 4 prerequisite: a downstream node (or a human at an approval
+    gate) must be able to read what a producing node actually made, not just
+    its hash. `ARTIFACT_PRODUCED` now carries the full payload, and the fold
+    stores it in `RunState.artifact_content` - this is what
+    `context.retriever.ContextRetriever.fetch` reads from."""
+    graph = WorkflowGraph(
+        name="content",
+        entry=("req",),
+        nodes=(agent("req"), terminal()),
+        edges=(Edge(source="req", target="done"),),
+    )
+    executors = {
+        "req": FixedExecutor(ok(kind="RequirementSpec", summary="s", source_text="raw text"))
+    }
+
+    state = await make_scheduler(graph, store, executors).run(run_id)
+
+    artifact_hash = state.nodes["req"].produced[0]
+    assert state.artifact_content[artifact_hash] == {"summary": "s", "source_text": "raw text"}
+
+
 async def test_config_error_for_unregistered_handler(store: JsonlEventStore, run_id: UUID) -> None:
     """A node naming a handler nobody registered is an authoring mistake -
     it must raise, not silently hang or skip the node."""
@@ -286,6 +310,36 @@ async def test_repair_cycle_halts_when_budget_exhausted(
     assert state.nodes["test"].status is NodeStatus.RETRYING
 
 
+async def test_a_repair_node_itself_failing_does_not_immediately_fail_the_run(
+    store: JsonlEventStore, run_id: UUID
+) -> None:
+    """`repair`'s only outgoing edge is `condition: always`, never
+    `on_failure` (exactly `workflows/greenfield.yaml`'s real
+    `repair`/`repair_domain`/`repair_api` shape). Before
+    `Scheduler._has_recovery_edge` recognised `ALWAYS` as recovery too, a
+    repair agent that itself failed here would have been reported as having
+    no recovery edge and immediately emitted `RUN_FAILED` - even though the
+    `always` edge had, in the very same call, already rescheduled `test` for
+    another attempt. Found while adding `kernel/tools/fs.py`'s shared-file
+    conflict guard: `agents/implementer.py`'s bounded reconciliation retry can
+    now make a repair position fail outright on a second conflict, and this
+    must degrade gracefully, not end the run."""
+    graph = _repair_graph(cycle_budget=2)
+    test_executor = SequenceExecutor([fail("compile error"), ok(kind="TestSuite")])
+    executors: dict[str, NodeExecutor] = {
+        "test": test_executor,
+        # Fails on its first attempt, succeeds on its second - standing in
+        # for `agents/implementer.py`'s reconciliation retry losing once and
+        # winning the next time `repair` is dispatched.
+        "repair": SequenceExecutor([fail("shared file conflict"), ok(kind="CodePatch")]),
+    }
+
+    state = await make_scheduler(graph, store, executors).run(run_id)
+
+    assert state.status is RunStatus.COMPLETED
+    assert test_executor.call_count == 2
+
+
 # --- 4. terminal failure with no recovery edge ------------------------------
 
 
@@ -385,6 +439,47 @@ async def test_clarification_cycle_halts_when_budget_exhausted(
     assert state.status is RunStatus.HALTED
     assert state.halt_reason is not None
     assert "cycle_budget" in state.halt_reason
+
+
+async def test_a_rejected_gate_with_no_recovery_edge_fails_cleanly_rather_than_hanging(
+    store: JsonlEventStore, run_id: UUID
+) -> None:
+    """Found via a live run: a gate with no `on_rejected` edge (unlike
+    `gate1` above) used to leave `state.status` silently stuck at RUNNING
+    forever once rejected - nothing downstream could ever become ready
+    (correctly), but nothing ever told the caller the run was actually over.
+    A rejected gate with no way forward must report `RunStatus.FAILED`, not
+    a `RunStatus.RUNNING` that will never change no matter how many more
+    times `run()` is called on this same run_id."""
+    graph = WorkflowGraph(
+        name="dead_end_rejection",
+        entry=("req",),
+        nodes=(
+            agent("req"),
+            NodeSpec(id="gate1", kind=NodeKind.GATE, requires_approval=True),
+            agent("arch"),
+            terminal(),
+        ),
+        edges=(
+            Edge(source="req", target="gate1"),
+            Edge(source="gate1", target="arch"),  # no on_rejected edge at all
+            Edge(source="arch", target="done"),
+        ),
+    )
+    executors: dict[str, NodeExecutor] = {
+        "req": FixedExecutor(ok(kind="RequirementSpec")),
+        "arch": FixedExecutor(ok(kind="DesignSpec")),
+    }
+    approvals = ScriptedApprovals(
+        {"gate1": [ApprovalDecision(granted=False, actor="alice", reason="not correct")]}
+    )
+
+    state = await make_scheduler(graph, store, executors, approvals=approvals).run(run_id)
+
+    assert state.status is RunStatus.FAILED
+    assert state.nodes["gate1"].status is NodeStatus.REJECTED
+    # arch correctly never ran - it has no valid path to readiness either.
+    assert "arch" not in state.nodes or state.nodes["arch"].status is NodeStatus.PENDING
 
 
 async def test_rejection_with_no_decision_leaves_run_awaiting(

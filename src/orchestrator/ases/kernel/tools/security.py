@@ -67,17 +67,32 @@ def scan_text(content: str) -> tuple[SecretFinding, ...]:
 
 
 async def _scan_for_secrets(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
+    """`ok=True` unconditionally - **scanning** succeeded whether or not it
+    found anything; a finding is data, not an operation failure.
+
+    This used to be `ok=not findings`, which silently defeated the whole
+    point of this tool: `kernel.scheduler._finish_agent_node` returns as soon
+    as it emits `NODE_FAILED` for a not-`ok` outcome, *before* the
+    artifact-emission code that would otherwise turn `output["findings"]`
+    into the `PolicyViolation` `agents/wiring.py`'s `_scan_artifact` builds
+    (`build_artifact` is consulted "regardless of `result.ok`", per that
+    module's own comment - but the artifact it builds was never actually
+    reaching an event, because the node had already failed and returned
+    first). `sec_scan` has no `ON_FAILURE` edge in `workflows/greenfield.yaml`
+    either, so the very first finding - even a false positive in a dev-only
+    placeholder connection string - would have taken down the entire run
+    with `RUN_FAILED`, instead of surfacing as the `PolicyViolation`
+    `agents/release.py` is explicitly written to read and weigh for the
+    human at `gate3` (see that module's own docstring on this exact
+    artifact). Detection still happens in full; only the reporting channel
+    changes, from "crash the run" to "hand it to the review this system
+    already has for exactly this purpose"."""
     findings = scan_text(str(args["content"]))
     return ToolOutcome(
-        ok=not findings,
+        ok=True,
         output={
             "findings": [{"rule": f.rule, "line": f.line, "excerpt": f.excerpt} for f in findings]
         },
-        error=(
-            None
-            if not findings
-            else f"{len(findings)} potential secret(s) found: {', '.join(f.rule for f in findings)}"
-        ),
     )
 
 

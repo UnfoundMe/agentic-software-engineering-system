@@ -235,6 +235,44 @@ async def test_schema_guard_refuses_when_no_version_is_recorded(run_id: UUID) ->
         await su_engine.dispose()
 
 
+async def test_artifacts_view_exposes_content_not_only_the_hash(
+    pg_store: PostgresEventStore, run_id: UUID
+) -> None:
+    """Phase 4 gap, closed by migration `b9dac5f510ef`: `control.artifacts`
+    used to project only `artifact_hash`/`kind`/`inputs` out of the event
+    payload, so a real agent's actual output was invisible to any SQL-side
+    reader even though the underlying JSONB `payload` column always carried
+    it. Proven here against the live, migrated database - not just the
+    Python-side fold (`tests/unit/test_state_fold.py` covers that)."""
+    await pg_store.append(
+        make_event(
+            run_id,
+            EventType.ARTIFACT_PRODUCED,
+            node_id="req",
+            artifact_hash="content-view-check",
+            kind="RequirementSpec",
+            content={"summary": "s", "source_text": "raw"},
+        )
+    )
+
+    engine = create_async_engine(settings().app_dsn)
+    try:
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT content FROM control.artifacts "
+                        "WHERE run_id = :run_id AND artifact_hash = :h"
+                    ),
+                    {"run_id": run_id, "h": "content-view-check"},
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+
+    assert row.content == {"summary": "s", "source_text": "raw"}
+
+
 async def test_workload_app_cannot_see_the_control_schema() -> None:
     """The isolation the entire database design rests on (docs/04 section
     1.1): the workload role has no USAGE on `control` at all."""

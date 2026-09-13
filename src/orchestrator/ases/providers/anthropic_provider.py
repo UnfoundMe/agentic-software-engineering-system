@@ -110,5 +110,40 @@ class AnthropicProvider:
         )
 
 
+def _enforce_additional_properties_false(schema: dict[str, Any]) -> None:
+    """Anthropic's raw-schema structured-output mode requires every
+    object-typed node to explicitly declare `additionalProperties: false` -
+    a schema that merely omits the key (JSON Schema's own default, meaning
+    "permissive") is rejected outright with a 400 before any completion is
+    attempted, as opposed to a normal `CompletionResult.schema_error` this
+    module's caller (`structured.py`) could otherwise repair.
+
+    Pydantic only emits the key when a model sets `extra="forbid"`
+    (`contracts.base.ArtifactModel` does, so every ordinary agent output
+    schema is already fine) - a plain `BaseModel` output schema is not, and
+    found live (`237d6873-...`, the first run ever to reach `migration`):
+    `agents.migration._MigrationProposal` had no `extra="forbid"`, and
+    `migration` has no `ON_FAILURE` recovery edge, so this one omission
+    crashed the entire run outright. That specific model is now fixed at the
+    source, but this function is the provider-boundary backstop for *any*
+    Pydantic model or nested submodel used as `output_schema`, present or
+    future, that makes the same omission - the LLM boundary is where the
+    wire contract with a specific vendor's structured-output mode belongs,
+    not scattered per-model reliance on remembering one config flag.
+
+    Mutates `schema` in place; only fills in what pydantic left unset, never
+    overrides an explicit value. Pydantic v2 flattens every nested
+    `BaseModel` into a top-level `$defs` entry (never inline), so one pass
+    over the root plus `$defs` covers a schema of any nesting depth.
+    """
+    if schema.get("type") == "object":
+        schema.setdefault("additionalProperties", False)
+    for definition in schema.get("$defs", {}).values():
+        if isinstance(definition, dict) and definition.get("type") == "object":
+            definition.setdefault("additionalProperties", False)
+
+
 def _json_schema_output_config(schema: type[Any]) -> OutputConfigParam:
-    return {"format": {"type": "json_schema", "schema": schema.model_json_schema()}}
+    raw_schema = schema.model_json_schema()
+    _enforce_additional_properties_false(raw_schema)
+    return {"format": {"type": "json_schema", "schema": raw_schema}}

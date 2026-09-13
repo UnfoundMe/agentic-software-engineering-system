@@ -1,10 +1,10 @@
 # Stage 1 greenfield workflow - docs/03 section 3.3's node choreography.
 #
-# Handler names match the agent plane docs/02 plans to build (Phase 4); none
-# of them exist yet, so this graph is exercised today only via
-# `WorkflowGraph.from_yaml` + `validate_graph()` (see
-# tests/unit/test_workflows.py) - it is not yet wired into a live Scheduler
-# run. That wiring is Phase 4 work, once real agents exist to be its handlers.
+# Handler names match the agent plane docs/02 Phase 4 built (see
+# agents/wiring.py's build_greenfield_executors, which maps every handler
+# name below to a real agent or tool executor) - this graph runs through a
+# live Scheduler today (tests/unit/test_greenfield_full_e2e.py), not just
+# WorkflowGraph.from_yaml() + validate_graph().
 #
 # Known simplification, stated plainly: DECOMPOSE's dynamic subgraph (the
 # IMPL_TASK_* fan-out) is not expressible in a static YAML file, since it is
@@ -12,6 +12,33 @@
 # hard-codes two implementation tasks (impl_domain, impl_api) as a stand-in
 # for what the decomposer would actually propose - real task count and shape
 # come from the decomposer's output once it exists.
+#
+# Per-task `dotnet build` exit gate (docs/02 Phase 4): `build_domain` and
+# `build_api` each gate their own implementation task, with their own bounded
+# repair position (`repair_domain`/`repair_api`) - compile failures surface
+# per task, not as a pile-up at the barrier's `test_run`.
+#
+# Migration pipeline (docs/04 section 4): `migration` generates and
+# classifies an EF Core migration from the domain implementation but never
+# applies it; `migration_gate` is a human approval node - the same mechanism
+# gate1/gate2/gate3 already use - placed before the one node
+# (`migration_apply`) that actually runs `ef.database_update`.
+#
+# Rejection cycles on every gate, not just gate1 (found via a live run:
+# rejecting gate2 silently stopped the workflow with no way to try again,
+# since only gate1 had an `on_rejected` edge). `gate2`/`migration_gate`/
+# `gate3` each loop back to the node whose output they are gating
+# (`arch`/`migration`/`release`), the same one-hop "producer tries again"
+# shape `gate1 -> req` already used - each bounded by a `cycle_budget` on the
+# producer, matching `req`'s. Each producer agent reads the human's rejection
+# reason via `ContextRetriever.rejection_reason_of` and feeds it back into
+# its own prompt, so a retry responds to *why* it was rejected rather than
+# regenerating the same content. Disclosed limit: `migration`/`release`
+# retries can only change what those two agents themselves decide (the
+# migration's name/rationale, the release assessment) - neither can rewrite
+# the underlying code a rejection might actually be about. Routing a
+# rejection further upstream (e.g. back to `impl_domain`) is a re-planning
+# concern (docs/02 Phase 7), not attempted here.
 
 name: greenfield
 description: >
@@ -39,6 +66,8 @@ nodes:
     kind: agent
     handler: architect
     produces: DesignSpec
+    join: any # ready on first arrival (gate1) OR after gate2 rejects
+    cycle_budget: 3 # bounds the redo cycle if gate2 rejects
     timeout_seconds: 180
 
   - id: gate2
@@ -70,6 +99,52 @@ nodes:
     handler: implementer
     produces: CodePatch
     timeout_seconds: 300
+
+  - id: build_domain
+    kind: tool
+    handler: dotnet_build_domain
+    join: any # ready on first arrival OR after repair_domain completes
+    cycle_budget: 2
+    timeout_seconds: 300
+
+  - id: build_api
+    kind: tool
+    handler: dotnet_build_api
+    join: any # ready on first arrival OR after repair_api completes
+    cycle_budget: 2
+    timeout_seconds: 300
+
+  - id: repair_domain
+    kind: agent
+    handler: implementer
+    produces: CodePatch
+    timeout_seconds: 300
+
+  - id: repair_api
+    kind: agent
+    handler: implementer
+    produces: CodePatch
+    timeout_seconds: 300
+
+  - id: migration
+    kind: agent
+    handler: migration
+    produces: MigrationPlan
+    join: any # ready on first arrival (build_domain) OR after migration_gate rejects
+    cycle_budget: 3 # bounds the redo cycle if migration_gate rejects
+    timeout_seconds: 180
+
+  - id: migration_gate
+    kind: gate
+    requires_approval: true
+    description: >
+      Human review of the generated migration SQL (docs/04 section 4, step
+      6) - the reviewer sees the SQL, not the C#.
+
+  - id: migration_apply
+    kind: tool
+    handler: ef_database_update
+    timeout_seconds: 120
 
   - id: barrier
     kind: barrier
@@ -120,6 +195,8 @@ nodes:
     kind: agent
     handler: release
     produces: ReleaseReport
+    join: any # ready on first arrival (quality_gate) OR after gate3 rejects
+    cycle_budget: 3 # bounds the redo cycle if gate3 rejects
     timeout_seconds: 120
 
   - id: gate3
@@ -135,12 +212,24 @@ edges:
   - { source: gate1, target: arch }
   - { source: gate1, target: req, condition: on_rejected }
   - { source: arch, target: gate2 }
+  - { source: gate2, target: arch, condition: on_rejected }
   - { source: gate2, target: scaffold }
   - { source: scaffold, target: decompose }
   - { source: decompose, target: impl_domain }
   - { source: decompose, target: impl_api }
-  - { source: impl_domain, target: barrier }
-  - { source: impl_api, target: barrier }
+  - { source: impl_domain, target: build_domain }
+  - { source: build_domain, target: repair_domain, condition: on_failure }
+  - { source: repair_domain, target: build_domain, condition: always }
+  - { source: build_domain, target: barrier }
+  - { source: impl_api, target: build_api }
+  - { source: build_api, target: repair_api, condition: on_failure }
+  - { source: repair_api, target: build_api, condition: always }
+  - { source: build_api, target: barrier }
+  - { source: build_domain, target: migration }
+  - { source: migration, target: migration_gate }
+  - { source: migration_gate, target: migration, condition: on_rejected }
+  - { source: migration_gate, target: migration_apply }
+  - { source: migration_apply, target: barrier }
   - { source: barrier, target: test_gen }
   - { source: test_gen, target: test_run }
   - { source: test_run, target: repair, condition: on_failure }
@@ -153,4 +242,5 @@ edges:
   - { source: docs_gen, target: quality_gate }
   - { source: quality_gate, target: release }
   - { source: release, target: gate3 }
+  - { source: gate3, target: release, condition: on_rejected }
   - { source: gate3, target: summary }

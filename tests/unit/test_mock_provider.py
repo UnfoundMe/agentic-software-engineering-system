@@ -74,3 +74,63 @@ async def test_a_scripted_parsed_response_round_trips() -> None:
     result = await provider.complete(_request(output_schema=RequirementSpec))
     assert result.parsed == spec
     assert result.usage.input_tokens == 10
+
+
+async def test_respond_to_matches_by_prompt_version_regardless_of_call_order() -> None:
+    """The property a shared provider needs under `asyncio.gather` concurrency
+    (e.g. two parallel implementation tasks): each caller gets the response
+    scripted for *its own* prompt_version, not whatever a FIFO queue would
+    have handed out next."""
+    provider = MockProvider()
+    spec_a = RequirementSpec(summary="a", source_text="raw")
+    spec_b = RequirementSpec(summary="b", source_text="raw")
+    provider.respond_to(
+        "b@v1", CompletionResult(text="b", parsed=spec_b, model_id="m", stop_reason="end_turn")
+    )
+    provider.respond_to(
+        "a@v1", CompletionResult(text="a", parsed=spec_a, model_id="m", stop_reason="end_turn")
+    )
+
+    # Deliberately requested out of registration order.
+    result_a = await provider.complete(_request(prompt_version="a@v1"))
+    result_b = await provider.complete(_request(prompt_version="b@v1"))
+
+    assert result_a.parsed == spec_a
+    assert result_b.parsed == spec_b
+
+
+async def test_respond_to_is_checked_before_the_generic_queue() -> None:
+    provider = MockProvider()
+    keyed = CompletionResult(text="keyed", model_id="m", stop_reason="end_turn")
+    queued = CompletionResult(text="queued", model_id="m", stop_reason="end_turn")
+    provider.respond_to("x@v1", keyed)
+    provider.respond_with(queued)
+
+    result = await provider.complete(_request(prompt_version="x@v1"))
+
+    assert result.text == "keyed"
+
+
+async def test_respond_to_does_not_consume_the_generic_queue() -> None:
+    provider = MockProvider()
+    provider.respond_to(
+        "x@v1", CompletionResult(text="keyed", model_id="m", stop_reason="end_turn")
+    )
+    provider.respond_with(CompletionResult(text="queued", model_id="m", stop_reason="end_turn"))
+
+    await provider.complete(_request(prompt_version="x@v1"))
+    result = await provider.complete(_request(prompt_version="unrelated@v1"))
+
+    assert result.text == "queued"
+
+
+async def test_respond_to_for_an_unmatched_prompt_version_falls_through_to_the_queue() -> None:
+    provider = MockProvider()
+    provider.respond_to(
+        "x@v1", CompletionResult(text="keyed", model_id="m", stop_reason="end_turn")
+    )
+    provider.respond_with(CompletionResult(text="queued", model_id="m", stop_reason="end_turn"))
+
+    result = await provider.complete(_request(prompt_version="different@v1"))
+
+    assert result.text == "queued"

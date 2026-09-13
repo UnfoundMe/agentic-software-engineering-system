@@ -142,7 +142,13 @@ LEGAL_TRANSITIONS: Mapping[NodeStatus, frozenset[NodeStatus]] = {
     # A rejected gate does not fail the run: it sends the producing node back
     # to be redone with the human's clarification. That backward edge is the
     # clarification cycle, and it is bounded by the node's cycle budget.
-    NodeStatus.REJECTED: frozenset({NodeStatus.READY, NodeStatus.FAILED, NodeStatus.HALTED}),
+    # RETRYING is the one-shot re-staging target fired by
+    # `Scheduler._propagate_edge_completion` when that producer settles
+    # again - see that method's docstring for why a REJECTED node must not
+    # be picked up by the generic readiness scan on its own.
+    NodeStatus.REJECTED: frozenset(
+        {NodeStatus.READY, NodeStatus.RETRYING, NodeStatus.FAILED, NodeStatus.HALTED}
+    ),
     NodeStatus.SUCCEEDED: frozenset({NodeStatus.STALE}),
     NodeStatus.FAILED: frozenset(
         {
@@ -240,6 +246,12 @@ class RunState(BaseModel):
 
     nodes: dict[str, NodeState] = Field(default_factory=dict)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
+    #: Full artifact content, keyed by hash - present only for events that
+    #: carried a `content` field in their payload (see `ARTIFACT_PRODUCED`
+    #: below). Kept separate from `ArtifactRecord`, which is pure provenance
+    #: metadata and predates this field; a run replayed from an older,
+    #: content-less export simply has an empty dict here, never a KeyError.
+    artifact_content: dict[str, Mapping[str, Any]] = Field(default_factory=dict)
     approvals: dict[str, ApprovalRecord] = Field(default_factory=dict)
     usage: Usage = Field(default_factory=Usage)
     policy_violations: int = 0
@@ -406,6 +418,9 @@ def apply(state: RunState, event: Event) -> RunState:
                 produced_at=event.created_at,
                 inputs=tuple(str(i) for i in inputs),
             )
+            content = payload.get("content")
+            if isinstance(content, Mapping):
+                state.artifact_content[artifact_hash] = content
             if event.node_id:
                 node = state.node(event.node_id)
                 node.produced = (*node.produced, artifact_hash)

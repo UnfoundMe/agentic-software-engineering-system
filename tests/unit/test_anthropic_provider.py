@@ -16,8 +16,9 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
+from pydantic import BaseModel
 
-from ases.contracts.artifacts import RequirementSpec
+from ases.contracts.artifacts import CodePatch, RequirementSpec
 from ases.providers.anthropic_provider import AnthropicProvider
 from ases.providers.base import CompletionRequest, ProviderError
 
@@ -145,6 +146,54 @@ async def test_structured_request_sends_a_json_schema_output_config() -> None:
     sent = messages.last_kwargs["output_config"]
     assert sent["format"]["type"] == "json_schema"
     assert sent["format"]["schema"]["properties"]["summary"]["type"] == "string"
+
+
+class _PlainSchemaWithoutExtraForbid(BaseModel):
+    """Stands in for `agents.migration._MigrationProposal`'s real defect
+    shape: a plain `BaseModel` output schema with no `extra="forbid"`, so
+    `model_json_schema()` omits `additionalProperties` entirely."""
+
+    name: str
+
+
+async def test_a_schema_missing_additional_properties_gets_it_filled_in() -> None:
+    """Regression test for run `237d6873-...`: `migration` was the first
+    node in any live run to use a non-`ArtifactModel` output schema
+    (`_MigrationProposal`, no `extra="forbid"`), and Anthropic's raw-schema
+    structured-output mode rejects a schema that merely omits
+    `additionalProperties` with a 400 - before any completion is attempted,
+    and with no `ON_FAILURE` recovery edge on `migration`, that crashed the
+    entire run. The provider must backstop this regardless of which model is
+    used, not rely on every schema author remembering the config flag."""
+    response = _FakeMessage(
+        content=[_FakeTextBlock(text='{"name": "x"}')],
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_FakeUsage(input_tokens=10, output_tokens=10),
+    )
+    provider, messages = _provider(response)
+    await provider.complete(_request(output_schema=_PlainSchemaWithoutExtraForbid))
+    sent_schema = messages.last_kwargs["output_config"]["format"]["schema"]
+    assert sent_schema["additionalProperties"] is False
+
+
+async def test_an_already_compliant_schema_is_left_alone() -> None:
+    """`ArtifactModel` (`extra="forbid"`) already emits `additionalProperties:
+    false` at every level - the backstop must not double-set or otherwise
+    disturb a schema that is already correct, at the root or in `$defs`."""
+    response = _FakeMessage(
+        content=[_FakeTextBlock(text='{"summary": "s", "files": [], "schema_version": 1}')],
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_FakeUsage(input_tokens=10, output_tokens=10),
+    )
+    provider, messages = _provider(response)
+    await provider.complete(_request(output_schema=CodePatch))
+    sent_schema = messages.last_kwargs["output_config"]["format"]["schema"]
+    assert sent_schema["additionalProperties"] is False
+    for definition in sent_schema.get("$defs", {}).values():
+        if definition.get("type") == "object":
+            assert definition["additionalProperties"] is False
 
 
 async def test_valid_structured_output_parses_successfully() -> None:
