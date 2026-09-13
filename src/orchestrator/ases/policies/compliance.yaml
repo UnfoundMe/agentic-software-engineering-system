@@ -1,0 +1,17 @@
+# Compliance pack: deliberately empty for now, and stated explicitly rather
+# than filled with a contrived rule to look complete (CLAUDE.md section 12:
+# "do not invent missing requirements"; core-development.md: "if
+# requirements are ambiguous, identify the ambiguity explicitly").
+#
+# Nothing in docs/00-02 names a concrete compliance rule at the granularity
+# `kernel.policy.Action` can express (tool name / side effect / actor kind).
+# What those docs do name - secret scanning, dependency vulnerability checks
+# - is validation-stage work (docs/03's L2 static validation, Phase 8), not
+# a tool-invocation policy, and is already implemented as its own tool
+# (`kernel/tools/security.py`) rather than a rule here.
+#
+# `load_policy_rules` treats a pack with an empty `rules:` list as a no-op,
+# so this file participates in loading (proving the four-pack shape docs/02
+# names) without asserting a rule nobody specified.
+
+rules: []

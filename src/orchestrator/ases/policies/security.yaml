@@ -1,0 +1,16 @@
+# Security pack (security-rules.md; CLAUDE.md sections 3 and 6). One
+# concrete rule grounded in the actual Phase 3 tool catalog: `dotnet.new` is
+# the one tool that scaffolds a brand-new, previously-nonexistent project
+# structure that every later step builds on - and it is `idempotent=False`,
+# so a mistaken invocation cannot simply be retried away. Escalating it for
+# review before anything is built on top mirrors docs/02 Phase 4's SCAFFOLD
+# node review, applied here at the tool-policy layer.
+
+rules:
+  - id: scaffolding-new-projects-requires-approval
+    description: >
+      Creating a new project structure is escalated for review before
+      further work builds on it.
+    when_tool_name: dotnet.new
+    decision: require_approval
+    reason: "security: a newly scaffolded project structure is reviewed before further work builds on it"

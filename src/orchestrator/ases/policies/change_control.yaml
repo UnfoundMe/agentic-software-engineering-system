@@ -1,0 +1,23 @@
+# Change-control pack (CLAUDE.md section 3: "Production, destructive, and
+# high-impact actions require human approval"). One rule today: any tool
+# whose side effect escapes the sandbox always requires approval, regardless
+# of what the tool's own ToolSpec declares - a policy pack may only tighten
+# a tool's own floor, never loosen it (kernel/policy.py's PolicyEngine
+# combines rules by taking the strictest, never the loosest).
+#
+# Currently inert against the Phase 3 tool catalog: every registered tool
+# (fs, git, dotnet, security) is `none` or `sandbox`. This rule is
+# scaffolding for the first `external`-side-effect tool a later phase
+# registers (e.g. a deployment or notification tool) - written now so the
+# pack format and its enforcement are proven before there is anything real
+# to enforce it against, the same way the Phase 2 prompt registry was built
+# before any real prompt existed.
+
+rules:
+  - id: external-side-effects-require-approval
+    description: >
+      Any tool whose side effect escapes the sandbox requires human
+      approval, regardless of the tool's own declared flag.
+    when_side_effect: external
+    decision: require_approval
+    reason: "change control: external side effects always require human approval"

@@ -1,0 +1,18 @@
+# Autonomy pack: bounds how far one action can chain without a human or an
+# agent re-entering the loop. One rule: a tool must never itself be the
+# actor requesting another tool's execution. Nothing in this codebase does
+# that today (no tool handler calls `ToolRegistry.invoke`), but denying it
+# explicitly at the policy layer closes the path structurally rather than by
+# omission - the same "unknown tools/actions are denied by default" posture
+# applied to *actors*, not just tool names, so an autonomous chain always
+# traces back to the kernel or an agent, never a tool calling a tool.
+
+rules:
+  - id: tools-may-not-invoke-tools
+    description: A registered tool must never itself request another tool's execution.
+    when_actor_kind: tool
+    decision: deny
+    reason: >-
+      autonomy: a tool invocation may not itself be the actor requesting
+      another tool's execution - every chain of tool calls must originate
+      from the kernel or an agent

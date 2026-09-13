@@ -3,7 +3,9 @@
 A governed orchestration kernel that drives LLM agents through the full SDLC,
 turning one natural-language requirement into a reviewable engineering outcome.
 
-> **Status: Phase 0 and Phase 1 fully complete.** Phase 2 (LLM boundary) not started.
+> **Status: Phase 0, Phase 1, Phase 2 (LLM boundary) and Phase 3
+> (tooling/sandbox/policy) complete.** Phase 4 (first vertical slice: the
+> greenfield agents) not started.
 >
 > | Area | State |
 > |---|---|
@@ -16,13 +18,51 @@ turning one natural-language requirement into a reviewable engineering outcome.
 > | `ases export` / `replay` | done — replay verified to work with Postgres stopped entirely |
 > | Pydantic artifact contracts (14, one per workflow `produces:` kind) | done |
 > | `workflows/greenfield.yaml` (Stage 1 graph, loads and validates) | done |
-> | Policy packs (Phase 3), agents/providers/sandbox/dashboard (Phase 2+) | not started, by design — see docs/02 |
+> | `LLMProvider` protocol, Anthropic adapter, cassette + mock providers | **done and tested** — cassette key excludes the model id (a router swap replays unchanged); mapping to the Anthropic SDK tested against an injected fake client, never the network |
+> | Capability-based `ModelNeeds` / `ModelSpec` / `ModelRouter` | done — catalog is exactly `claude-opus-5` / `claude-sonnet-5` per docs/02 Phase 2 |
+> | Versioned prompt registry (`providers/prompts/registry.py`) | done as a mechanism — no real prompt is registered yet; the first one lands with the first agent (Phase 4) |
+> | Structured-output validation, exactly one bounded repair attempt | done and tested (`providers/structured.py`) |
+> | Scoped context retriever (`context/retriever.py`) | **partial, by necessity** — artifact summaries from `RunState` work now; full-content `fetch()` deliberately raises `ArtifactContentUnavailableError`, since no content-addressed artifact store exists yet to resolve a hash back to a payload (see the module docstring and the Known Gaps note below) |
+> | Token/cost metadata on every completion | done at the boundary (`CompletionResult.usage`); not yet flowing into a live run's event log, since no `NodeExecutor` calls an agent yet — `kernel.state`'s `LLM_COMPLETED` fold case already exists and is ready for Phase 4 to wire up |
+> | Deny-by-default `ToolRegistry` (`kernel/tools/registry.py`) | **done and tested** — unknown tool, write outside `writable_paths`, and timeout are all refused before a handler ever runs |
+> | `dotnet` tools: `new`, `restore`, `build`, `test`, `format`, `list package --vulnerable` | done and tested against an injected fake subprocess runner — exactly the six docs/02 Phase 3 names, no more |
+> | `fs` tools (`read_file`, `write_file`), confined to the sandbox root | done and tested, including two confirmed-then-fixed path-traversal exploits (see Known Issues Found below) |
+> | `git` tools: `status`, `diff` (read-only only) | done — deliberately no mutating action; see the module's own scoping note |
+> | Secret-scanning tool (`kernel/tools/security.py`) | done and tested — pattern-based (AWS/Anthropic/OpenAI/GitHub/Slack keys, private-key blocks, hardcoded credential assignments) |
+> | `PolicyEngine` + 4 YAML rule packs (change control, security, compliance, autonomy) | done and tested — a pack can only tighten a tool's own `requires_approval` floor, never loosen it |
+> | `CapabilityManifest` + self-escalation denial | done and tested — a request for a tool outside an actor's manifest is `DENY`, never silently dropped |
+> | Sandbox workspaces (`sandbox/workspace.py`) | **done and tested for real** — actual `git worktree add`/`remove`, not mocked; sandbox rollback (discarding the worktree) verified to leave the real repository untouched |
+> | Prompt-injection containment (`providers/untrusted.py`) | done and tested — content-derived nonce delimiters, with a redaction pass as defence in depth |
+> | Real agents, dashboard (Phase 4+) | not started, by design — see docs/02 |
 > | Dynamic subgraph admission wired into a live run; full re-planning (Phase 7) | not started — see `kernel/scheduler.py`'s module docstring for the exact boundary |
 >
-> 186 tests (unit + integration + invariants), mypy `--strict`, ruff clean.
+> 365 tests (unit + integration + invariants), mypy `--strict`, ruff clean.
 > `./scripts/dev-up.sh` now works end to end - see
 > [`docs/06-VALIDATION-GUIDE.md`](docs/06-VALIDATION-GUIDE.md) to reproduce
 > and cross-check everything above yourself.
+>
+> **Known gap carried forward:** `docs/02`'s repository layout names
+> `context/store.py` (a content-addressed artifact store) but no phase bullet
+> ever builds it, and no code path persists an artifact's actual payload
+> anywhere a hash could resolve back to it — the event log only ever records
+> the hash (by design, docs/05 §8). This was surfaced, not silently patched
+> over, while building the scoped context retriever above; it blocks nothing
+> in Phase 2 and should be picked up when Phase 4 gives agents real content
+> worth storing.
+>
+> **Security issues found and fixed while building Phase 3, not merely
+> claimed fixed:** `kernel.tools.fs`'s path confinement and the registry's
+> `writable_paths` check both initially relied on `PurePosixPath`, which is
+> purely lexical and Windows-unaware. Verified interactively on this
+> machine: a backslash-form Windows path (`C:\Windows\System32\x`) becomes a
+> single opaque path segment under `PurePosixPath`, which `pathlib.Path`
+> then resolves as a real absolute path on a Windows host — silently
+> discarding the sandbox root during a join. Both the `fs.write_file`
+> handler and the registry's structural `path_args` check shared this gap;
+> both are now fixed via one shared validator
+> (`kernel.tools.classification.is_safe_relative_path`), and both fixes are
+> pinned by regression tests (`test_tool_fs.py`,
+> `test_tool_registry.py`) that fail again if the check regresses.
 
 ---
 
