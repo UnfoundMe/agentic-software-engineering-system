@@ -1,0 +1,114 @@
+"""The live `LLMProvider` adapter, backed by the Anthropic Messages API.
+
+Used directly under `ASES_LLM_MODE=live`, and wrapped by
+`cassette.RecordingProvider` under `ASES_LLM_MODE=record`. Never constructed
+under `replay` or `mock` - see `factory.get_provider`.
+
+Structured output deliberately does **not** use the SDK's `messages.parse()`
+helper. That helper raises the raw `pydantic.ValidationError` out of the SDK
+call itself when the model's JSON fails to validate, which would discard the
+response's usage/cost and stop_reason along with it - and usage is billed
+regardless of whether the output validated. Instead this adapter builds the
+JSON-schema `output_config` itself (docs: "Raw Schema" structured-output
+pattern), always gets back a normal `Message` with real usage, and validates
+the text against the Pydantic model itself - so a schema failure becomes
+`CompletionResult.schema_error` (data `structured.py` can act on) with usage
+still attached, never a swallowed exception.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
+
+import anthropic
+from anthropic.types import MessageParam
+from anthropic.types.output_config_param import OutputConfigParam
+from pydantic import ValidationError
+
+from ases.providers.base import (
+    CompletionRequest,
+    CompletionResult,
+    CompletionUsage,
+    Message,
+    ProviderError,
+)
+from ases.providers.models import ModelCatalogEntryNotFoundError, spec_for
+
+
+def _to_message_param(message: Message) -> MessageParam:
+    return {"role": message.role, "content": message.content}
+
+
+def _first_text(content: Sequence[Any]) -> str:
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", "")
+            return str(text)
+    return ""
+
+
+def _usage(usage: Any, model_id: str) -> CompletionUsage:
+    input_tokens = int(usage.input_tokens)
+    output_tokens = int(usage.output_tokens)
+    try:
+        spec = spec_for(model_id)
+        usd = spec.cost_usd(input_tokens=input_tokens, output_tokens=output_tokens)
+    except ModelCatalogEntryNotFoundError:
+        # A model id outside the Phase 2 catalog (e.g. called directly in a
+        # test, or a future model) still returns real usage - just without a
+        # cost figure we have no price for. Silence here would hide spend;
+        # zero is the honest "unknown," not a guess.
+        usd = 0.0
+    return CompletionUsage(input_tokens=input_tokens, output_tokens=output_tokens, usd=usd)
+
+
+class AnthropicProvider:
+    """Live `LLMProvider`. See module docstring for the structured-output design."""
+
+    def __init__(self, api_key: str, *, client: anthropic.AsyncAnthropic | None = None) -> None:
+        self._client = client or anthropic.AsyncAnthropic(api_key=api_key)
+
+    async def complete(self, request: CompletionRequest) -> CompletionResult:
+        messages = [_to_message_param(m) for m in request.messages]
+        system = request.system if request.system is not None else anthropic.omit
+        output_config = (
+            _json_schema_output_config(request.output_schema)
+            if request.output_schema is not None
+            else anthropic.omit
+        )
+        try:
+            response = await self._client.messages.create(
+                model=request.model_id,
+                max_tokens=request.max_tokens,
+                system=system,
+                messages=messages,
+                output_config=output_config,
+            )
+        except anthropic.APIConnectionError as exc:
+            raise ProviderError(f"could not reach Anthropic: {exc}") from exc
+        except anthropic.APIStatusError as exc:
+            raise ProviderError(f"Anthropic returned {exc.status_code}: {exc.message}") from exc
+
+        text = _first_text(response.content)
+        usage = _usage(response.usage, request.model_id)
+        parsed = None
+        schema_error: str | None = None
+        if request.output_schema is not None:
+            try:
+                parsed = request.output_schema.model_validate_json(text)
+            except ValidationError as exc:
+                schema_error = str(exc)
+
+        return CompletionResult(
+            text=text,
+            parsed=parsed,
+            schema_error=schema_error,
+            model_id=response.model,
+            stop_reason=response.stop_reason or "unknown",
+            usage=usage,
+        )
+
+
+def _json_schema_output_config(schema: type[Any]) -> OutputConfigParam:
+    return {"format": {"type": "json_schema", "schema": schema.model_json_schema()}}
