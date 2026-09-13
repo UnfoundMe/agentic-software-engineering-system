@@ -194,6 +194,7 @@ agents and no LLM in the process.
 | [`docs/04`](docs/04-DATA-AND-MIGRATION-STRATEGY.md) | Schema lifecycle, bootstrap, migration safety |
 | [`docs/01`](docs/01-PLAN-DELTA-ANALYSIS.md) | Why each decision changed |
 | [`docs/00`](docs/00-IMPLEMENTATION-PLAN.md) | Superseded — retained as decision lineage |
+| [`docs/07`](docs/07-LIVE-RUN-TROUBLESHOOTING.md) | Live-run findings log — every issue a real LLM/`dotnet` run has surfaced, root cause, and fix |
 
 ---
 

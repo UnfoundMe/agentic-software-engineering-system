@@ -54,11 +54,18 @@ def test_a_short_quoted_string_that_looks_like_a_word_is_not_flagged() -> None:
     assert findings == ()
 
 
-async def test_tool_handler_reports_ok_false_when_findings_exist() -> None:
+async def test_tool_handler_reports_ok_true_even_when_findings_exist() -> None:
+    """`ok=True` regardless of findings: a finding is data for the
+    `PolicyViolation` artifact (`agents/wiring.py`'s `_scan_artifact`) to
+    carry to `agents/release.py`/`gate3`'s human review, not an operation
+    failure. `sec_scan` has no `ON_FAILURE` edge in `workflows/greenfield.yaml`
+    - `ok=False` here used to mean `kernel.scheduler._finish_agent_node`
+    failed the entire run before that artifact was ever emitted, on the very
+    first finding, false positive or not."""
     result = await SCAN_FOR_SECRETS.handler({"content": "AKIAABCDEFGHIJKLMNOP"}, _ctx())
-    assert result.ok is False
+    assert result.ok is True
     assert len(result.output["findings"]) == 1
-    assert "aws_access_key_id" in (result.error or "")
+    assert result.output["findings"][0]["rule"] == "aws_access_key_id"
 
 
 async def test_tool_handler_reports_ok_true_for_clean_content() -> None:

@@ -42,6 +42,37 @@ async def test_resume_with_a_checkpoint_equals_full_fold(
     assert via_resume.model_dump() == via_fold.model_dump()
 
 
+async def test_a_saved_checkpoint_round_trips_artifact_content(
+    store: JsonlEventStore, run_id: UUID, tmp_path: Path
+) -> None:
+    """Phase 4 prerequisite, checked at the checkpoint layer too: a
+    checkpoint is a full `RunState.model_dump_json()`, so `artifact_content`
+    (added alongside the hash-only `artifacts` record) must survive a
+    save/load round trip through an actual file on disk, not just an
+    in-memory fold."""
+    checkpoints = CheckpointStore(tmp_path / "cp")
+    await store.append(make_event(run_id, EventType.RUN_CREATED, workflow="greenfield"))
+    await store.append(make_event(run_id, EventType.NODE_READY, node_id="req"))
+    await store.append(make_event(run_id, EventType.NODE_STARTED, node_id="req"))
+    await store.append(
+        make_event(
+            run_id,
+            EventType.ARTIFACT_PRODUCED,
+            node_id="req",
+            artifact_hash="h-req",
+            kind="RequirementSpec",
+            content={"summary": "s", "source_text": "raw"},
+        )
+    )
+
+    state = fold(run_id, await store.read_all(run_id))
+    await checkpoints.save(Checkpoint(run_id=run_id, seq=state.last_seq, state=state))
+
+    reloaded = await checkpoints.load(run_id)
+    assert reloaded is not None
+    assert reloaded.state.artifact_content["h-req"] == {"summary": "s", "source_text": "raw"}
+
+
 async def test_deleting_the_checkpoint_changes_nothing_but_replay_cost(
     store: JsonlEventStore, run_id: UUID, tmp_path: Path
 ) -> None:

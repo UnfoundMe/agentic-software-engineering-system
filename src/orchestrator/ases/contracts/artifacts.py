@@ -185,6 +185,24 @@ class PolicyViolation(ArtifactModel):
     node_id: str | None = None
 
 
+# --- migration (docs/04 section 4: generate and classify, never apply) ----
+
+
+class MigrationPlan(ArtifactModel):
+    """Output of the migration agent. `classification` is never LLM-decided -
+    it is filled in from `kernel.tools.migrations.classify_migration`'s
+    deterministic verdict (safe | risky | destructive | opaque) on the
+    materialized SQL, consistent with CLAUDE.md section 10's "deterministic
+    validation is authoritative". The agent itself never applies this plan -
+    `workflows/greenfield.yaml` gates `ef.database_update` behind a human
+    approval node, the same mechanism gate1/gate2/gate3 already use."""
+
+    migration_name: str
+    summary: str
+    sql: str
+    classification: str  # safe | risky | destructive | opaque
+
+
 # --- release --------------------------------------------------------------
 
 
@@ -224,6 +242,7 @@ CONTRACTS: dict[str, type[ArtifactModel]] = {
     "TestSuite": TestSuite,
     "ReviewReport": ReviewReport,
     "PolicyViolation": PolicyViolation,
+    "MigrationPlan": MigrationPlan,
     "ReleaseReport": ReleaseReport,
     "RunSummary": RunSummary,
 }

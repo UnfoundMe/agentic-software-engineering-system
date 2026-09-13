@@ -131,6 +131,46 @@ def test_artifact_is_recorded_with_its_lineage(run_id: UUID) -> None:
     assert state.nodes["arch"].produced == ("h-design",)
 
 
+def test_artifact_content_is_captured_when_the_payload_carries_it(run_id: UUID) -> None:
+    state = fold(
+        run_id,
+        _chain(
+            run_id,
+            (EventType.NODE_READY, {"node_id": "arch"}),
+            (EventType.NODE_STARTED, {"node_id": "arch"}),
+            (
+                EventType.ARTIFACT_PRODUCED,
+                {
+                    "node_id": "arch",
+                    "artifact_hash": "h-design",
+                    "kind": "DesignSpec",
+                    "content": {"summary": "a design"},
+                },
+            ),
+        ),
+    )
+    assert state.artifact_content["h-design"] == {"summary": "a design"}
+
+
+def test_artifact_content_is_absent_without_error_when_the_payload_has_none(run_id: UUID) -> None:
+    """An older, content-less export (recorded before this field existed)
+    must replay cleanly - a missing `content` key is not a fold error."""
+    state = fold(
+        run_id,
+        _chain(
+            run_id,
+            (EventType.NODE_READY, {"node_id": "arch"}),
+            (EventType.NODE_STARTED, {"node_id": "arch"}),
+            (
+                EventType.ARTIFACT_PRODUCED,
+                {"node_id": "arch", "artifact_hash": "h-design", "kind": "DesignSpec"},
+            ),
+        ),
+    )
+    assert "h-design" not in state.artifact_content
+    assert state.artifacts["h-design"].kind == "DesignSpec"
+
+
 def test_approval_binds_to_the_artifact_hash(run_id: UUID) -> None:
     """Binding is what makes revocation correct rather than advisory."""
     state = fold(
