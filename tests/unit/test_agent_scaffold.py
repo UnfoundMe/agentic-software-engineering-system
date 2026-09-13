@@ -354,9 +354,7 @@ def test_template_for_selects_webapi_only_for_host_suffixes(
         ("Microsoft.EntityFrameworkCore/8.0.0", "Microsoft.EntityFrameworkCore"),
     ],
 )
-def test_package_id_strips_any_version_the_model_still_includes(
-    spec: str, expected: str
-) -> None:
+def test_package_id_strips_any_version_the_model_still_includes(spec: str, expected: str) -> None:
     assert ScaffoldAgent._package_id(spec) == expected
 
 
