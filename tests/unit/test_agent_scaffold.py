@@ -10,6 +10,7 @@ here is the *wiring* (capability check, tool_cwd, argument passing), not the
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -296,7 +297,7 @@ async def test_run_raises_if_the_sandbox_reset_fails() -> None:
     )
     agent = ScaffoldAgent()
 
-    with pytest.raises(ScaffoldToolFailureError, match="git.reset_sandbox"):
+    with pytest.raises(ScaffoldToolFailureError, match=re.escape("git.reset_sandbox")):
         await agent.run(ctx, agent.build_input(ctx))
     # The reset failed, so nothing else - not even the LLM call - should have
     # been attempted.

@@ -303,7 +303,12 @@ def test_consuming_a_contract_declared_in_a_later_project_is_reported() -> None:
                 component="Shop.Domain",
                 consumes_contracts=("IApiOnly",),
             ),
-            TaskSpec(id="api", description="y", component="Shop.Api", produces_contracts=("IApiOnly",)),
+            TaskSpec(
+                id="api",
+                description="y",
+                component="Shop.Api",
+                produces_contracts=("IApiOnly",),
+            ),
         )
     )
 
