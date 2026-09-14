@@ -788,14 +788,15 @@ section 4.2 before spending more run budget on it):
 
 ---
 
-## 19. `migration` will fail deterministically the moment it reaches `ef.migrations_add` - no `DbContext` is ever written
+## 19. `migration` would have failed deterministically at `ef.migrations_add` - no `DbContext` was ever written
 
 **Not yet seen live** - run `237d6873-...` crashed at the LLM-schema bug
-(#18) before ever reaching this tool call, so this is a step ahead: found by
-checking docs/04 section 4.2's own prerequisite ("1. ENTITY DESIGN -
-Implementer agent writes entities **+ DbContext** (sandbox)") against what
-`workflows/greenfield.yaml` actually wires, the same way issues #12-#14 were
-found before a live run could hit them.
+(#18) before ever reaching this tool call, so this was found a step ahead of
+where a live run would have hit it: checking docs/04 section 4.2's own
+prerequisite ("1. ENTITY DESIGN - Implementer agent writes entities **+
+DbContext** (sandbox)") against what `workflows/greenfield.yaml` actually
+wired at the time, the same way issues #12-#14 were found before a live run
+could hit them.
 
 **The gap:** the workflow hard-codes exactly two implementation positions,
 `impl_domain` (entities, explicitly "zero infrastructure deps" per its own
@@ -817,24 +818,85 @@ application service provider was found... consider adding an
 recovery edge - the run ends there, the same shape of failure as #18, one
 step later.
 
-**Not fixed here - a real scope decision, not a bug fix.** The correct fix
-is a third implementation position (`impl_infrastructure`, with its own
-`build_infrastructure`/`repair_infrastructure` pair, mirroring
+**Fixed, once the decision was made explicitly.** A third implementation
+position, `impl_infrastructure`, was wired into `workflows/greenfield.yaml`
+with its own `build_infrastructure`/`repair_infrastructure` pair, mirroring
 `impl_domain`/`impl_api`/`build_domain`/`build_api`/`repair_domain`/
-`repair_api` exactly) wired into `workflows/greenfield.yaml` and
-`agents/wiring.py`, plus deciding whether `MigrationAgent.build_input`
-should read that new node's `CodePatch` too (entities alone, from
-`impl_domain`, may still be enough context for the LLM's name/rationale -
-the SQL itself comes from the compiled `DbContext`, not from what this
-agent reads). This is real topology work, not a defect fix, and is exactly
-the kind of change CLAUDE.md section 12 wants an explicit decision (and
-ideally an ADR) for before it lands - not something to add silently while
-chasing a live-run failure.
+`repair_api` exactly - `decompose -> impl_infrastructure -> build_infrastructure`,
+the same `on_failure`/`always` repair loop, and its own entry into `barrier`.
+`agents/wiring.py`'s `_build_infrastructure_args` scopes its `dotnet build`
+to the `.Infrastructure`-suffixed project, reusing `ef_targets`'s own
+targeting logic rather than re-implementing it; `_IMPLEMENTATION_NODE_IDS`
+(the list `sec_scan` reads) gained the new node too, so its generated code is
+scanned for secrets like every other implementation task's.
+`MigrationAgent.build_input` was deliberately **not** changed to read
+`impl_infrastructure`'s `CodePatch`: this agent's LLM call only ever decides
+a migration name and rationale, never the SQL, and `dotnet ef` reads the
+compiled sandbox directly - what actually needed fixing was *when*
+`migration` is allowed to run, not what it reads. That is `migration`'s new
+`join: quorum, quorum: 2` (see the workflow YAML's own header comment): with
+three incoming edges now (`build_domain`, `build_infrastructure`,
+`migration_gate`'s `on_rejected` redo), `join: any` would have let it fire
+the moment either build finished, and `join: all` is unusable here for the
+same reason it already was for `arch`/`release` (the `on_rejected` edge's
+source hasn't run on the first pass) - `quorum: 2` is what correctly
+expresses "both real prerequisites, or the redo edge once both have already
+succeeded."
 
 **Recognize it again:** `dotnet ef` reporting no `DbContext`/no application
-service provider/suggesting `IDesignTimeDbContextFactory` is this gap, not a
-new defect - check whether an Infrastructure implementation task has been
-wired in yet before assuming anything else changed.
+service provider/suggesting `IDesignTimeDbContextFactory` after this fix
+means either `impl_infrastructure`'s generated code doesn't actually define
+one, or `build_infrastructure` didn't actually succeed before `migration`
+ran - check `migration`'s join is still `quorum: 2` over exactly
+`{build_domain, build_infrastructure, migration_gate}` before assuming
+anything else regressed.
+
+---
+
+## 20. A live run crashed outright with `ConnectionError: unexpected connection_lost() call`
+
+**Symptom (live, recurring, `ases run greenfield` on Windows):**
+```
+ConnectionError: unexpected connection_lost() call
+Sandbox left in place for inspection: ...
+```
+No `node.failed`/`run.failed` event at all - the process aborted before the
+scheduler could record anything, straight out of `interfaces/cli.py`'s
+top-level catch-all.
+
+**Root cause:** this is a documented CPython defect
+(gh-83413/bpo-33694), not an ASES bug - on Windows, `asyncio`'s
+`ProactorEventLoop` can invoke an SSL transport's `connection_lost()` twice
+when a connection is torn down after sitting briefly idle, and the second
+call raises a bare `ConnectionError`. It surfaces underneath both `httpx` and
+the Anthropic SDK, so it is not an instance of `anthropic.APIConnectionError`
+- `anthropic_provider.py`'s `except anthropic.APIConnectionError` clause
+never caught it, the SDK's own internal retry never saw it either, and
+nothing in `providers/` retried anything (confirmed: no retry/backoff
+anywhere in that package before this fix). It went uncaught straight through
+the scheduler, and since an LLM call has no `ON_FAILURE` recovery edge of its
+own, one transient Windows network hiccup ended the entire run.
+
+**Fix:** `anthropic_provider.py`'s `AnthropicProvider._create_with_retry`
+retries up to `_MAX_ATTEMPTS` (3) times, with linear backoff
+(`_RETRY_BACKOFF_SECONDS * attempt`), on `_TRANSIENT_ERRORS =
+(anthropic.APIConnectionError, ConnectionError)` specifically - both are
+"could not complete this request, try again," as opposed to
+`anthropic.APIStatusError` (a real response from Anthropic, e.g. a 4xx/5xx),
+which still fails immediately with no retry, unchanged from before. `sleep`
+is constructor-injectable (defaults to `asyncio.sleep`) so
+`tests/unit/test_anthropic_provider.py` can exercise all three outcomes
+(exhausts retries and wraps as `ProviderError`, recovers mid-retry, status
+errors skip retry entirely) without a real backoff delay.
+
+**Recognize it again:** a bare `ConnectionError: unexpected connection_lost()
+call` (or any `type(exc).__name__` other than `ProviderError`) crashing a run
+with no orchestration event at all is this class of issue - check that it
+happened during a live LLM call, not a `dotnet`/`git` tool invocation (those
+have their own, separate concurrency story - see issue #17). If it recurs
+despite the retry, the connection is failing on every one of 3 attempts, not
+intermittently - that points at a real network/API-key problem, not this
+transport defect.
 
 ---
 

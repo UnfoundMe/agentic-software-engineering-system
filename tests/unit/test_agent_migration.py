@@ -77,11 +77,13 @@ def _state_with_domain_patch(patch: CodePatch, skeleton: SolutionSkeleton = _SKE
     state.artifacts["h-domain"] = ArtifactRecord(
         artifact_hash="h-domain",
         kind="CodePatch",
-        node_id="impl_domain",
+        node_id="impl:domain-entities",
         produced_at=datetime.now(UTC),
     )
     state.artifact_content["h-domain"] = patch.model_dump(mode="json")
-    state.nodes["impl_domain"] = NodeState(node_id="impl_domain", produced=("h-domain",))
+    state.nodes["impl:domain-entities"] = NodeState(
+        node_id="impl:domain-entities", produced=("h-domain",)
+    )
     state.artifacts["h-skeleton"] = ArtifactRecord(
         artifact_hash="h-skeleton",
         kind="SolutionSkeleton",
@@ -114,16 +116,21 @@ _DOMAIN_PATCH = CodePatch(
 )
 
 
-def test_build_input_reads_the_domain_patch_from_impl_domain() -> None:
+def test_build_input_reads_every_implementation_patch_the_run_produced() -> None:
+    """This agent used to read exactly one node, `impl_domain`. That node no
+    longer exists - implementation nodes are admitted at runtime and which of
+    them holds the entity definitions is not knowable from a node id. It
+    reads all of them instead: a superset of what it had, containing the
+    entity types EF Core needs wherever the architecture put them."""
     agent = MigrationAgent()
     ctx = _ctx(MockProvider(), _state_with_domain_patch(_DOMAIN_PATCH), _registry(_FakeRunner()))
 
     inp = agent.build_input(ctx)
 
-    assert inp == MigrationAgentInput(domain_patch=_DOMAIN_PATCH, skeleton=_SKELETON)
+    assert inp == MigrationAgentInput(implementations=(_DOMAIN_PATCH,), skeleton=_SKELETON)
 
 
-def test_build_input_without_a_domain_implementation_raises() -> None:
+def test_build_input_without_a_scaffolded_solution_raises() -> None:
     agent = MigrationAgent()
     ctx = _ctx(MockProvider(), RunState(run_id=uuid4()), _registry(_FakeRunner()))
     with pytest.raises(NoArtifactFromNodeError):

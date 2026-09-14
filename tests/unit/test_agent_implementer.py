@@ -20,6 +20,7 @@ from ases.contracts.artifacts import (
     CodePatch,
     DesignSpec,
     FileChange,
+    FrozenInterface,
     SolutionSkeleton,
     TaskGraph,
     TaskSpec,
@@ -42,8 +43,23 @@ def _record(hash_: str, kind: str, node_id: str) -> ArtifactRecord:
 def _base_state() -> RunState:
     state = RunState(run_id=uuid4())
     design = DesignSpec(summary="d")
-    skeleton = SolutionSkeleton(projects=("A",), frozen_interfaces=("public interface IX {}",))
-    tasks = TaskGraph(tasks=(TaskSpec(id="t1", description="the domain entity"),))
+    skeleton = SolutionSkeleton(
+        projects=("A", "A.Api"),
+        frozen_interfaces=(
+            FrozenInterface(signature="public interface IX {}", namespace="A", project="A"),
+        ),
+    )
+    tasks = TaskGraph(
+        tasks=(
+            TaskSpec(id="t1", description="the domain entity", component="A"),
+            TaskSpec(
+                id="t2",
+                description="the HTTP surface",
+                component="A.Api",
+                depends_on=("t1",),
+            ),
+        )
+    )
 
     state.artifacts["h-design"] = _record("h-design", "DesignSpec", "arch")
     state.artifact_content["h-design"] = design.model_dump(mode="json")
@@ -82,17 +98,54 @@ def _ctx(provider: MockProvider, state: RunState, node_id: str, tmp_path: Path) 
     )
 
 
-def test_build_input_derives_focus_from_the_current_node_id(tmp_path: Path) -> None:
-    ctx = _ctx(MockProvider(), _base_state(), "impl_domain", tmp_path)
+def test_build_input_derives_focus_from_the_task_the_node_implements(tmp_path: Path) -> None:
+    """The focus text is the decomposer's own task description and component,
+    read back from the run's TaskGraph. It used to come from a hard-coded
+    table mapping `impl_domain` -> "the domain layer: entities and business
+    rules" - this agent having an opinion about what layers a system has,
+    which is precisely what stopped the Application layer from ever being
+    implemented."""
+    ctx = _ctx(MockProvider(), _base_state(), "impl:t1", tmp_path)
+
     inp = ImplementerAgent().build_input(ctx)
-    assert "domain layer" in inp.focus
+
+    assert "A" in inp.focus
+    assert "the domain entity" in inp.focus
     assert inp.prior_error is None
 
 
-def test_build_input_for_the_api_position_has_a_different_focus(tmp_path: Path) -> None:
-    ctx = _ctx(MockProvider(), _base_state(), "impl_api", tmp_path)
+def test_a_different_task_gets_that_task_s_focus(tmp_path: Path) -> None:
+    ctx = _ctx(MockProvider(), _base_state(), "impl:t2", tmp_path)
     inp = ImplementerAgent().build_input(ctx)
-    assert "API layer" in inp.focus
+    assert "A.Api" in inp.focus
+    assert "the HTTP surface" in inp.focus
+
+
+def test_a_generated_repair_node_reads_its_own_task_s_build_failure(tmp_path: Path) -> None:
+    """`repair:t2` reads `build:t2` - derived from the id, not from a table
+    that had to list every repair position in advance."""
+    state = _base_state()
+    state.nodes["build:t2"] = NodeState(node_id="build:t2")
+    state.nodes["build:t2"].last_error = "CS0246: 'IX' could not be found"
+    ctx = _ctx(MockProvider(), state, "repair:t2", tmp_path)
+
+    inp = ImplementerAgent().build_input(ctx)
+
+    assert inp.prior_error == "CS0246: 'IX' could not be found"
+    assert "A.Api" in inp.focus
+    assert "dotnet build" in inp.focus
+
+
+def test_a_repair_node_does_not_read_a_sibling_task_s_failure(tmp_path: Path) -> None:
+    """Each task's repair is scoped to its own build. Handing `repair:t2` the
+    failure of a project it has no business editing is what made `repair_api`
+    unable to act on anything in live run `009ea59f-...`."""
+    state = _base_state()
+    state.nodes["build:t1"] = NodeState(node_id="build:t1")
+    state.nodes["build:t1"].last_error = "a failure in a different task"
+    ctx = _ctx(MockProvider(), state, "repair:t2", tmp_path)
+
+    assert ImplementerAgent().build_input(ctx).prior_error is None
 
 
 def test_build_input_for_repair_reads_the_prior_test_run_failure(tmp_path: Path) -> None:

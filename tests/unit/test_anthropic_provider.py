@@ -56,14 +56,25 @@ class _FakeMessage:
 
 class _FakeMessagesResource:
     def __init__(
-        self, response: _FakeMessage | None = None, error: Exception | None = None
+        self,
+        response: _FakeMessage | None = None,
+        error: Exception | None = None,
+        side_effects: list[_FakeMessage | Exception] | None = None,
     ) -> None:
         self._response = response
         self._error = error
+        self._side_effects = list(side_effects) if side_effects is not None else None
         self.last_kwargs: dict[str, Any] = {}
+        self.call_count = 0
 
     async def create(self, **kwargs: Any) -> _FakeMessage:
         self.last_kwargs = kwargs
+        self.call_count += 1
+        if self._side_effects is not None:
+            outcome = self._side_effects.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         if self._error is not None:
             raise self._error
         assert self._response is not None
@@ -75,12 +86,22 @@ class _FakeClient:
     messages: _FakeMessagesResource = field(default_factory=_FakeMessagesResource)
 
 
+async def _no_op_sleep(_seconds: float) -> None:
+    """Injected in place of `asyncio.sleep` so retry-backoff tests run
+    instantly instead of pausing for real seconds."""
+
+
 def _provider(
-    response: _FakeMessage | None = None, error: Exception | None = None
+    response: _FakeMessage | None = None,
+    error: Exception | None = None,
+    side_effects: list[_FakeMessage | Exception] | None = None,
 ) -> tuple[AnthropicProvider, _FakeMessagesResource]:
-    messages = _FakeMessagesResource(response, error)
+    messages = _FakeMessagesResource(response, error, side_effects)
     client = _FakeClient(messages=messages)
-    return AnthropicProvider("test-key", client=client), messages  # type: ignore[arg-type]
+    return (
+        AnthropicProvider("test-key", client=client, sleep=_no_op_sleep),  # type: ignore[arg-type]
+        messages,
+    )
 
 
 async def test_plain_completion_extracts_text_and_usage() -> None:
@@ -254,6 +275,48 @@ async def test_an_api_status_error_is_wrapped_as_provider_error() -> None:
         await provider.complete(_request())
 
 
+async def test_a_bare_connection_error_is_retried_then_wrapped() -> None:
+    """The Windows asyncio/SSL transport defect (docs/07) raises a bare
+    `ConnectionError`, not `anthropic.APIConnectionError` - it must be caught
+    and retried the same way, not left to escape as an uncaught exception."""
+    provider, messages = _provider(error=ConnectionError("unexpected connection_lost() call"))
+    with pytest.raises(ProviderError):
+        await provider.complete(_request())
+    assert messages.call_count == 3
+
+
+async def test_a_transient_connection_error_recovers_on_retry() -> None:
+    response = _FakeMessage(
+        content=[_FakeTextBlock(text="hi there")],
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_FakeUsage(input_tokens=10, output_tokens=5),
+    )
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    provider, messages = _provider(
+        side_effects=[
+            ConnectionError("unexpected connection_lost() call"),
+            anthropic.APIConnectionError(request=req),
+            response,
+        ]
+    )
+    result = await provider.complete(_request())
+    assert result.text == "hi there"
+    assert messages.call_count == 3
+
+
+async def test_an_api_status_error_is_never_retried() -> None:
+    """A real response from Anthropic (e.g. a 4xx/5xx) is not a transient
+    connection blip - it must fail immediately, exactly as before."""
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx2.Response(500, request=req)
+    error = anthropic.APIStatusError("server exploded", response=resp, body=None)
+    provider, messages = _provider(error=error)
+    with pytest.raises(ProviderError):
+        await provider.complete(_request())
+    assert messages.call_count == 1
+
+
 async def test_system_prompt_is_forwarded_when_present() -> None:
     response = _FakeMessage(
         content=[_FakeTextBlock(text="ok")],
@@ -283,3 +346,82 @@ async def test_history_is_forwarded_before_the_rendered_prompt() -> None:
     await provider.complete(_request(rendered_prompt="second turn", history=history))
     sent = messages.last_kwargs["messages"]
     assert [m["content"] for m in sent] == ["first turn", "ack", "second turn"]
+
+
+# --- truncation, reported as itself ----------------------------------------
+#
+# Live run `009ea59f-...`, `repair_infrastructure` attempt 1 and `repair_api`
+# attempt 2: `stop_reason == "max_tokens"` reached while the model was still
+# inside its (default, adaptive) thinking block, so the response carried no
+# `text` block at all. The adapter reported `text=""`, pydantic called that
+# "Invalid JSON: EOF while parsing a value at line 1 column 0", and the
+# operator was told the model had written malformed JSON.
+
+
+@dataclass
+class _FakeThinkingBlock:
+    thinking: str
+    type: str = "thinking"
+
+
+async def test_a_response_that_ran_out_of_tokens_mid_thinking_is_reported_as_truncated() -> None:
+    response = _FakeMessage(
+        # Exactly the live shape: a thinking block, and nothing else.
+        content=[_FakeThinkingBlock(thinking="Let me work through the build errors...")],
+        model="claude-opus-5",
+        stop_reason="max_tokens",
+        usage=_FakeUsage(input_tokens=7314, output_tokens=16000),
+    )
+    provider, _ = _provider(response)  # type: ignore[arg-type]
+
+    result = await provider.complete(_request(output_schema=CodePatch, max_tokens=16000))
+
+    assert result.truncated is True
+    assert result.parsed is None
+    assert result.text == ""
+    assert result.schema_error is not None
+    # The message must name the real cause before the parse error, so an
+    # operator reading the event log is not sent after a JSON bug.
+    assert result.schema_error.startswith("response truncated at max_tokens=16000")
+    assert "16000 output tokens" in result.schema_error
+    assert "did not finish its response" in result.schema_error
+    # Usage is still billed and still reported - truncated output is not free.
+    assert result.usage.output_tokens == 16000
+    assert result.usage.usd > 0
+
+
+async def test_a_truncated_response_that_did_emit_partial_text_is_still_truncated() -> None:
+    """Half a JSON document is the other shape truncation takes, when the
+    model gets past thinking and is cut off mid-string."""
+    response = _FakeMessage(
+        content=[_FakeTextBlock(text='{"summary": "fixing the build err')],
+        model="claude-opus-5",
+        stop_reason="max_tokens",
+        usage=_FakeUsage(input_tokens=10, output_tokens=16000),
+    )
+    provider, _ = _provider(response)
+
+    result = await provider.complete(_request(output_schema=CodePatch, max_tokens=16000))
+
+    assert result.truncated is True
+    assert result.schema_error is not None
+    assert result.schema_error.startswith("response truncated at max_tokens=16000")
+
+
+async def test_a_schema_failure_under_a_normal_stop_reason_is_not_marked_truncated() -> None:
+    """The discrimination has to work in both directions: a model that
+    genuinely answered wrongly must not be excused as truncated, or the
+    boundary would raise `max_tokens` at a prompt problem forever."""
+    response = _FakeMessage(
+        content=[_FakeTextBlock(text='{"not": "a code patch"}')],
+        model="claude-opus-5",
+        stop_reason="end_turn",
+        usage=_FakeUsage(input_tokens=10, output_tokens=20),
+    )
+    provider, _ = _provider(response)
+
+    result = await provider.complete(_request(output_schema=CodePatch))
+
+    assert result.truncated is False
+    assert result.schema_error is not None
+    assert "truncated" not in result.schema_error

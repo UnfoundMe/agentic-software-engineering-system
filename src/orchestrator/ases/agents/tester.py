@@ -16,6 +16,7 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict
 
 from ases.agents.base import Agent, AgentContext, AgentExecutionError, AgentResult, Citation
+from ases.agents.planner import implementation_node_ids, implementation_patches
 from ases.contracts.artifacts import CodePatch, DesignSpec, TestSuite
 from ases.kernel.policy import CapabilityManifest
 from ases.providers.models import ModelNeeds
@@ -87,19 +88,12 @@ class TesterAgent:
     model_needs: ClassVar[ModelNeeds] = ModelNeeds(reasoning="high", structured_output=True)
 
     DESIGN_NODE_ID: ClassVar[str] = "arch"
-    #: Both parallel implementation tasks - see the module docstring on why
-    #: this agent reads more than one upstream node.
-    IMPLEMENTATION_NODE_IDS: ClassVar[tuple[str, ...]] = ("impl_domain", "impl_api")
 
     def build_input(self, ctx: AgentContext) -> TesterAgentInput:
         design = ctx.retriever.fetch_latest_from(self.DESIGN_NODE_ID)
         assert isinstance(design, DesignSpec)
-        implementations: list[CodePatch] = []
-        for node_id in self.IMPLEMENTATION_NODE_IDS:
-            patch = ctx.retriever.fetch_latest_from(node_id)
-            assert isinstance(patch, CodePatch)
-            implementations.append(patch)
-        return TesterAgentInput(design=design, implementations=tuple(implementations))
+        implementations = implementation_patches(ctx.retriever.state)
+        return TesterAgentInput(design=design, implementations=implementations)
 
     async def run(self, ctx: AgentContext, inp: TesterAgentInput) -> AgentResult[TestSuite]:
         file_paths = [f.path for patch in inp.implementations for f in patch.files]
@@ -139,7 +133,8 @@ class TesterAgent:
                 f"implementation(s); wrote {written} of {len(artifact.files)} declared file(s)."
             ),
             citations=tuple(
-                Citation(source=f"artifact:{node_id}") for node_id in self.IMPLEMENTATION_NODE_IDS
+                Citation(source=f"artifact:{node_id}")
+                for node_id in implementation_node_ids(ctx.retriever.state)
             ),
             usage=usage,
         )

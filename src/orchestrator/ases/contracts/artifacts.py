@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ases.contracts.base import ArtifactModel
 
@@ -95,31 +95,210 @@ class DesignSpec(ArtifactModel):
     key_decisions: tuple[str, ...] = ()
 
 
+class ProjectPackages(ArtifactModel):
+    """Which NuGet packages one specific project needs.
+
+    Exists because the alternative - installing every `pinned_packages` entry
+    into every project, which `agents/scaffold.py` did until a live run
+    (`009ea59f-...`) showed what it costs - puts EF Core, Redis and xunit into
+    a Domain project CLAUDE.md section 9 requires to depend on none of them,
+    and puts framework-supplied packages into the web host, where .NET 10's
+    package pruning rejects them outright (`NU1510` under `-warnaserror`).
+
+    Deliberately declared by the scaffold agent rather than inferred from
+    project names by the orchestrator: which layer needs which package is an
+    architecture fact the agent that chose the architecture knows, and name
+    inference is exactly what this system is not supposed to route on.
+    """
+
+    project: str
+    packages: tuple[str, ...] = ()
+
+
+class FrozenInterface(ArtifactModel):
+    """One type whose shape *and location* parallel implementation tasks must
+    agree on.
+
+    This carried only `signature` until live run `91229361-...`. That run's
+    Application task declared `IShortLinkCache` in `namespace
+    UrlShortener.Application`; the Infrastructure cache task, running later
+    and having never seen that code, wrote `using
+    UrlShortener.Application.Ports;` and failed to compile against a type it
+    had the exact signature of. A signature with no namespace pins what a
+    type looks like and leaves where it lives to be guessed independently by
+    every task that touches it - and a guess made by the declaring task and a
+    guess made by the consuming task agree only by luck.
+
+    `namespace` is what the compiler actually resolves against, so it is
+    required. `project` says which assembly declares it, which is what tells
+    a consumer whether it needs a `ProjectReference` at all.
+    """
+
+    #: The C# signature, e.g. `public interface IShortLinkCache { ... }`.
+    signature: str
+    #: The namespace it is declared in, verbatim - `UrlShortener.Application`,
+    #: not `UrlShortener.Application.Abstractions` unless that is literally
+    #: what the file says. The declaring task writes this namespace and every
+    #: consuming task imports it; neither gets a choice.
+    namespace: str = Field(min_length=1)
+    #: The project whose assembly contains it.
+    project: str = Field(min_length=1)
+
+
 class SolutionSkeleton(ArtifactModel):
     """Output of `SCAFFOLD` (docs/02 section 7.1): the frozen project
     structure and interface signatures that parallel implementation tasks
     build against - this is what removes interface drift as a failure mode."""
 
     projects: tuple[str, ...] = ()
+    #: Every package the solution needs, across all projects. Retained as the
+    #: solution-wide inventory (and as the fallback `scaffold` installs
+    #: everywhere when `project_packages` is empty - see
+    #: `ScaffoldAgent._packages_for`).
     pinned_packages: tuple[str, ...] = ()
-    frozen_interfaces: tuple[str, ...] = ()
+    #: Per-project routing for `pinned_packages`. Empty means "no routing
+    #: stated"; `scaffold` then falls back to the solution-wide behaviour.
+    project_packages: tuple[ProjectPackages, ...] = ()
+    #: The shared contract every parallel implementation task builds
+    #: against: signature *and* namespace, so no task has to guess where a
+    #: type its dependency declared actually lives. See `FrozenInterface`.
+    frozen_interfaces: tuple[FrozenInterface, ...] = ()
+
+    def frozen_interface_block(self) -> str:
+        """The frozen contract as a prompt-ready block, grouped by namespace.
+
+        Rendering lives here rather than in each agent because `decompose`
+        and `implementer` must show the model the *same* contract - one of
+        them quietly dropping the namespace is the failure this type exists
+        to prevent.
+        """
+        if not self.frozen_interfaces:
+            return "(none stated)"
+        by_namespace: dict[tuple[str, str], list[str]] = {}
+        for interface in self.frozen_interfaces:
+            by_namespace.setdefault((interface.namespace, interface.project), []).append(
+                interface.signature
+            )
+        blocks = []
+        for (namespace, project), signatures in by_namespace.items():
+            body = chr(10).join(f"    {s}" for s in signatures)
+            header = f"namespace {namespace};   // declared in project {project}"
+            blocks.append(header + chr(10) + body)
+        return (chr(10) * 2).join(blocks)
 
 
 # --- planning -----------------------------------------------------------
 
 
 class TaskSpec(ArtifactModel):
-    id: str
+    """One unit of implementation work the decomposer proposes.
+
+    `component` and `depends_on` are what make this executable rather than
+    merely descriptive. Until they were consumed, `workflows/greenfield.yaml`
+    carried a hard-coded `impl_domain`/`impl_api`/`impl_infrastructure`
+    fan-out as a stand-in, and live run `009ea59f-...` showed the cost: the
+    decomposer emitted five `app-*` tasks for a project the static graph had
+    no node for, so `UrlShortener.Application` was never implemented at all
+    and everything that compiles against it failed. The task list was right;
+    nothing executed it.
+    """
+
+    id: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_.-]+$")
     description: str
+    #: Which project/component this task writes into. Must name one of
+    #: `SolutionSkeleton.projects` - checked at subgraph admission
+    #: (`agents.planner`), not here, since this model has no access to the
+    #: skeleton. Empty means "not stated", which admission rejects.
+    component: str = ""
+    #: The task's role. Only `implementation` is executable today; the field
+    #: exists so a decomposer can label work the runtime does not yet route
+    #: (documentation, migration, benchmark) without that being indistinguishable
+    #: from an implementation task it silently failed to run.
+    kind: str = "implementation"
+    #: Ids of tasks that must have been implemented **and compiled** before
+    #: this one starts. Explicit, never inferred from naming, folder layout
+    #: or list order - see `TaskGraph`'s validator.
     depends_on: tuple[str, ...] = ()
 
 
 class TaskGraph(ArtifactModel):
-    """Output of the decomposer. In the running scheduler this becomes a
-    subgraph proposal (`WorkflowGraph.with_subgraph`) - not yet wired to a
-    live run; see `kernel/scheduler.py`'s module docstring."""
+    """Output of the decomposer, and the authority on what implementation
+    work a run performs: `agents.planner.TaskGraphSubgraphProvider` turns it
+    into a live subgraph admitted through `WorkflowGraph.with_subgraph`.
+
+    The validator below runs at the LLM boundary, so a decomposer that
+    proposes a self-contradictory plan produces an ordinary schema error -
+    repaired once by `providers.structured.complete_structured`, and
+    classified `AGENT_PROTOCOL_FAILURE` if that repair fails. An
+    unsatisfiable plan must never reach the scheduler at all; the graph's own
+    `validate_graph` is the second line of defence, not the first.
+    """
 
     tasks: tuple[TaskSpec, ...] = ()
+
+    @model_validator(mode="after")
+    def _dependencies_are_satisfiable(self) -> TaskGraph:
+        ids = [t.id for t in self.tasks]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate task ids: {duplicates}")
+        known = set(ids)
+        for task in self.tasks:
+            unknown = sorted(set(task.depends_on) - known)
+            if unknown:
+                raise ValueError(f"task {task.id!r} depends on unknown task(s): {unknown}")
+            if task.id in task.depends_on:
+                raise ValueError(f"task {task.id!r} depends on itself")
+        if cycle := _first_task_cycle(self.tasks):
+            raise ValueError(f"task dependencies form a cycle: {' -> '.join(cycle)}")
+        return self
+
+    def ordered_ids(self) -> tuple[str, ...]:
+        """Task ids in a dependency-respecting order. Useful for reporting and
+        for tests; the scheduler never consults it - it derives readiness from
+        graph edges, which is where dependency ordering actually executes."""
+        remaining = {t.id: set(t.depends_on) for t in self.tasks}
+        ordered: list[str] = []
+        while remaining:
+            ready = sorted(tid for tid, deps in remaining.items() if not deps - set(ordered))
+            if not ready:  # pragma: no cover - the validator rejects cycles first
+                break
+            ordered.extend(ready)
+            for tid in ready:
+                del remaining[tid]
+        return tuple(ordered)
+
+
+def _first_task_cycle(tasks: tuple[TaskSpec, ...]) -> list[str] | None:
+    """A dependency cycle as a readable path, or None. Iterative DFS with a
+    colouring, so the error names the actual cycle rather than just asserting
+    one exists - a decomposer being told "a -> b -> a" can fix it; one told
+    "your graph has a cycle" often cannot."""
+    adjacency = {t.id: list(t.depends_on) for t in tasks}
+    white, grey, black = 0, 1, 2
+    colour = dict.fromkeys(adjacency, white)
+    for root in adjacency:
+        if colour[root] != white:
+            continue
+        stack: list[tuple[str, int]] = [(root, 0)]
+        path: list[str] = []
+        while stack:
+            node, index = stack[-1]
+            if index == 0:
+                colour[node] = grey
+                path.append(node)
+            if index < len(adjacency[node]):
+                stack[-1] = (node, index + 1)
+                child = adjacency[node][index]
+                if colour.get(child) == grey:
+                    return [*path[path.index(child) :], child]
+                if colour.get(child) == white:
+                    stack.append((child, 0))
+            else:
+                colour[node] = black
+                path.pop()
+                stack.pop()
+    return None
 
 
 # --- implementation -------------------------------------------------------

@@ -25,7 +25,7 @@ from ases.agents.scaffold import (
     register_prompts,
 )
 from ases.context.retriever import ContextRetriever, NoArtifactFromNodeError
-from ases.contracts.artifacts import DesignSpec, SolutionSkeleton
+from ases.contracts.artifacts import DesignSpec, FrozenInterface, ProjectPackages, SolutionSkeleton
 from ases.kernel.state import ArtifactRecord, NodeState, RunState
 from ases.kernel.tools.dotnet import build_dotnet_tools
 from ases.kernel.tools.registry import ToolRegistry
@@ -103,7 +103,13 @@ async def test_run_materializes_each_planned_project_via_dotnet_new() -> None:
     skeleton = SolutionSkeleton(
         projects=("UrlShortener.Domain", "UrlShortener.Api"),
         pinned_packages=("Microsoft.EntityFrameworkCore/10.0.0",),
-        frozen_interfaces=("public interface IUrlRepository { }",),
+        frozen_interfaces=(
+            FrozenInterface(
+                signature="public interface IUrlRepository { }",
+                namespace="UrlShortener.Application",
+                project="UrlShortener.Application",
+            ),
+        ),
     )
     provider = MockProvider()
     provider.respond_with(
@@ -394,3 +400,140 @@ async def test_run_installs_no_packages_when_none_are_pinned() -> None:
     await agent.run(ctx, agent.build_input(ctx))
 
     assert not any(c[2] == "package" for c in runner.calls if len(c) > 2)
+
+
+# --- per-project package routing (PROMPT_VERSION 3) -------------------------
+#
+# Until v3 every `pinned_packages` entry was installed into every project
+# (`_materialize_project`'s old solution-wide loop). Live run `009ea59f-...`
+# showed the two distinct failures that causes, and these pin both fixes.
+
+
+def _packages_added(runner: _FakeRunner) -> list[tuple[str, str]]:
+    """(project, package) for every `dotnet add <project> package <id>` call."""
+    return [
+        (str(call[2]), str(call[4]))
+        for call in runner.calls
+        if tuple(call[:2]) == ("dotnet", "add") and len(call) > 4 and call[3] == "package"
+    ]
+
+
+async def _run_scaffold(skeleton: SolutionSkeleton) -> _FakeRunner:
+    provider = MockProvider()
+    provider.respond_with(
+        CompletionResult(
+            text=skeleton.model_dump_json(),
+            parsed=skeleton,
+            model_id="m",
+            stop_reason="end_turn",
+        )
+    )
+    runner = _FakeRunner()
+    ctx = _ctx(provider, _state_with_design(DesignSpec(summary="d")), _registry(runner))
+    agent = ScaffoldAgent()
+    await agent.run(ctx, agent.build_input(ctx))
+    return runner
+
+
+async def test_a_package_is_installed_only_into_the_project_that_declared_it() -> None:
+    """CLAUDE.md section 9: the domain layer must not depend on EF Core,
+    PostgreSQL or Redis. Before v3 it got all three, plus xunit, because
+    every pinned package went into every project."""
+    runner = await _run_scaffold(
+        SolutionSkeleton(
+            projects=("Shop.Domain", "Shop.Infrastructure"),
+            pinned_packages=("Microsoft.EntityFrameworkCore", "xunit"),
+            project_packages=(
+                ProjectPackages(project="Shop.Domain", packages=()),
+                ProjectPackages(
+                    project="Shop.Infrastructure", packages=("Microsoft.EntityFrameworkCore",)
+                ),
+            ),
+        )
+    )
+
+    assert _packages_added(runner) == [("Shop.Infrastructure", "Microsoft.EntityFrameworkCore")]
+
+
+async def test_a_framework_supplied_package_is_never_referenced_by_a_web_host() -> None:
+    """`NU1510` under `-warnaserror`, which failed restore on `build_api`
+    before any C# was compiled. Stripped deterministically even though the
+    model routed it to the API project - see `_FRAMEWORK_SUPPLIED_PACKAGES`."""
+    runner = await _run_scaffold(
+        SolutionSkeleton(
+            projects=("Shop.Api",),
+            pinned_packages=("Microsoft.Extensions.DependencyInjection.Abstractions",),
+            project_packages=(
+                ProjectPackages(
+                    project="Shop.Api",
+                    packages=(
+                        "Microsoft.Extensions.DependencyInjection.Abstractions",
+                        "Microsoft.Extensions.Configuration.Abstractions",
+                        # NOT in the shared framework despite the prefix - must survive.
+                        "Microsoft.AspNetCore.OpenApi",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert _packages_added(runner) == [("Shop.Api", "Microsoft.AspNetCore.OpenApi")]
+
+
+async def test_a_class_library_keeps_the_same_package_a_web_host_must_drop() -> None:
+    """The strip is scoped to web hosts on purpose: for a plain
+    `Microsoft.NET.Sdk` class library these are ordinary packages, and the
+    live run carried them in three class libraries with no diagnostic at
+    all. Dropping them everywhere would break a library that needs one."""
+    runner = await _run_scaffold(
+        SolutionSkeleton(
+            projects=("Shop.Application",),
+            pinned_packages=("Microsoft.Extensions.DependencyInjection.Abstractions",),
+            project_packages=(
+                ProjectPackages(
+                    project="Shop.Application",
+                    packages=("Microsoft.Extensions.DependencyInjection.Abstractions",),
+                ),
+            ),
+        )
+    )
+
+    assert _packages_added(runner) == [
+        ("Shop.Application", "Microsoft.Extensions.DependencyInjection.Abstractions")
+    ]
+
+
+async def test_an_artifact_without_routing_falls_back_to_solution_wide_packages() -> None:
+    """An older `SolutionSkeleton`, or a model that answered without
+    `project_packages`. Installing nothing would be a worse, harder-to-read
+    failure than the over-broad behaviour this replaces."""
+    runner = await _run_scaffold(
+        SolutionSkeleton(
+            projects=("Shop.Domain", "Shop.Infrastructure"),
+            pinned_packages=("Microsoft.EntityFrameworkCore",),
+        )
+    )
+
+    assert _packages_added(runner) == [
+        ("Shop.Domain", "Microsoft.EntityFrameworkCore"),
+        ("Shop.Infrastructure", "Microsoft.EntityFrameworkCore"),
+    ]
+
+
+async def test_a_project_absent_from_routing_gets_nothing_when_routing_exists() -> None:
+    """Routing stated but silent about a project means "none", not "fall
+    back to everything" - otherwise declaring routing for one project would
+    silently leave every other project on the old solution-wide behaviour."""
+    runner = await _run_scaffold(
+        SolutionSkeleton(
+            projects=("Shop.Domain", "Shop.Infrastructure"),
+            pinned_packages=("Microsoft.EntityFrameworkCore",),
+            project_packages=(
+                ProjectPackages(
+                    project="Shop.Infrastructure", packages=("Microsoft.EntityFrameworkCore",)
+                ),
+            ),
+        )
+    )
+
+    assert _packages_added(runner) == [("Shop.Infrastructure", "Microsoft.EntityFrameworkCore")]

@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath
 
 from ases.context.retriever import ContextRetriever
+from ases.kernel.failures import FailureKind
 from ases.kernel.graph import NodeSpec
 from ases.kernel.scheduler import NodeExecutionOutcome
 from ases.kernel.state import RunState
@@ -23,8 +24,15 @@ from ases.kernel.tools.registry import ToolRegistry
 #: Builds the tool's `args` mapping from the current run's folded state - the
 #: tool-node counterpart to `agents.base.Agent.build_input`. Takes a
 #: `ContextRetriever` (never the raw `RunState`) for the same scoping reason
-#: every agent does.
-ArgsBuilder = Callable[[ContextRetriever], Mapping[str, object]]
+#: every agent does, plus the `NodeSpec` being executed.
+#:
+#: The node argument is what lets **one** registered handler serve many
+#: nodes. Before dynamic task admission there were three `dotnet_build_*`
+#: handlers, one per hard-coded build node, each closing over its own
+#: project - which cannot work when the build nodes are admitted at runtime
+#: and there are as many of them as the decomposer proposed. The builder now
+#: resolves its arguments from the node it is actually running for.
+ArgsBuilder = Callable[[ContextRetriever, NodeSpec], Mapping[str, object]]
 
 #: Builds an artifact payload (or `None`, meaning "no artifact this time")
 #: from a successful tool invocation's output - e.g. turning
@@ -33,7 +41,7 @@ ArgsBuilder = Callable[[ContextRetriever], Mapping[str, object]]
 ArtifactBuilder = Callable[[Mapping[str, object]], Mapping[str, object] | None]
 
 
-def _no_args(retriever: ContextRetriever) -> Mapping[str, object]:
+def _no_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
     return {}
 
 
@@ -56,6 +64,7 @@ class ToolNodeExecutor:
         build_args: ArgsBuilder = _no_args,
         artifact_kind: str | None = None,
         build_artifact: ArtifactBuilder = _no_artifact,
+        failure_kind: FailureKind = FailureKind.TOOL_FAILURE,
     ) -> None:
         self._tool_name = tool_name
         self._tools = tools
@@ -63,16 +72,25 @@ class ToolNodeExecutor:
         self._build_args = build_args
         self._artifact_kind = artifact_kind
         self._build_artifact = build_artifact
+        #: How a failure of *this* tool should be classified. Supplied by the
+        #: wiring, which is the layer that knows a given node invokes
+        #: `dotnet.build` rather than, say, a security scan - never inferred
+        #: here from the tool's name, and never decided by the kernel.
+        #: `BUILD_FAILURE` is the expected, designed-for outcome the repair
+        #: cycle exists to act on, and reads very differently in an event log
+        #: from a tool that broke.
+        self._failure_kind = failure_kind
 
     async def execute(self, node: NodeSpec, state: RunState) -> NodeExecutionOutcome:
         retriever = ContextRetriever(state)
-        args = self._build_args(retriever)
+        args = self._build_args(retriever, node)
         tool_ctx = ToolContext(cwd=self._tool_cwd, run_id=str(state.run_id), node_id=node.id)
         result = await self._tools.invoke(self._tool_name, args, tool_ctx)
 
         if result.denied:
             return NodeExecutionOutcome(
                 ok=False,
+                failure_kind=FailureKind.POLICY_DENIED,
                 error=f"tool {self._tool_name!r} denied: {result.error}",
             )
 
@@ -86,6 +104,7 @@ class ToolNodeExecutor:
 
         return NodeExecutionOutcome(
             ok=result.ok,
+            failure_kind=self._failure_kind,
             error=result.error,
             artifact_kind=self._artifact_kind if artifact_payload is not None else None,
             artifact_payload=artifact_payload,
