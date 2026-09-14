@@ -181,6 +181,34 @@ async def test_a_retry_is_told_why_the_previous_plan_was_rejected() -> None:
     assert "no implementation task targets ['B']" in prompt
 
 
+async def test_the_prompt_asks_for_contract_linkage_and_cohesion() -> None:
+    """Pins that the model is actually told to split a project's frozen
+    interfaces into cohesive tasks rather than one task per project - this
+    project has no live LLM to assert the resulting split against, so the
+    invariant this test can pin is "the instruction is present," the same
+    way other agent tests here assert prompt content rather than model
+    judgment."""
+    design = DesignSpec(summary="d")
+    skeleton = SolutionSkeleton(projects=("A",))
+    plan = TaskGraph(tasks=(TaskSpec(id="t1", description="domain", component="A"),))
+    provider = MockProvider()
+    provider.respond_with(
+        CompletionResult(
+            text=plan.model_dump_json(), parsed=plan, model_id="m", stop_reason="end_turn"
+        )
+    )
+    recording = _Recording(provider)
+    ctx = _ctx(recording, _state_with(design, skeleton))  # type: ignore[arg-type]
+    agent = DecomposeAgent()
+
+    await agent.run(ctx, agent.build_input(ctx))
+
+    prompt = recording.requests[0].rendered_prompt
+    assert "produces_contracts" in prompt
+    assert "consumes_contracts" in prompt
+    assert "cohesive concern" in prompt
+
+
 async def test_a_first_attempt_carries_no_correction_section() -> None:
     design = DesignSpec(summary="d")
     skeleton = SolutionSkeleton(projects=("A",))

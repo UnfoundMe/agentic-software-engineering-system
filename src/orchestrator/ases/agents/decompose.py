@@ -55,7 +55,24 @@ PROMPT_NAME = "decompose.plan"
 #: into real `impl:`/`build:`/`repair:` nodes and needs to know what to
 #: build. It also states plainly that the list *is* the work - the previous
 #: wording described planning, not execution.
-PROMPT_VERSION = 2
+#:
+#: v3 (was v2): two additions. First, `files`/`produces_contracts`/
+#: `consumes_contracts` (new `TaskSpec` fields) - a task now names the files
+#: it writes and which of the frozen interfaces it declares or needs, so
+#: `validation/structure.py`'s `check_contract_graph` can verify every
+#: consumed contract has a producer, and `agents/implementer.py` can show a
+#: task exactly the contracts relevant to it instead of the whole solution's.
+#: Second, explicit cohesion guidance: v2's only granularity wording was
+#: about *concurrency* ("large enough that splitting... lets independent
+#: work proceed in parallel"), which a real run showed is not the same
+#: question as *cohesion* - a live run's `infrastructure-adapters` task
+#: covered persistence, caching, code generation, clock access and dependency
+#: injection as one task, none of which the model judged worth splitting for
+#: parallelism even though they are unrelated concerns. Asking for
+#: `produces_contracts` per task is itself part of the fix: a model that must
+#: enumerate which interfaces one task owns has to notice when that list
+#: spans several unrelated concerns.
+PROMPT_VERSION = 3
 PROMPT_TEMPLATE = """You are the Decomposer Agent in a governed software \
 engineering system. You never decide what happens next in the workflow - \
 you only break approved, scaffolded work into implementation tasks.
@@ -80,6 +97,12 @@ except a test-only project nothing else depends on - a project nobody implements
 as an empty placeholder and fails every project that references it.
 - kind: "implementation".
 - depends_on: the ids of tasks that must be implemented and compiled first.
+- files: the file paths, relative to the solution root, this task expects to create or modify.
+- produces_contracts: the type_name of every frozen interface (from the list above) this \
+task declares. Every frozen interface routed to this task's component that this task is \
+responsible for writing must be named here - and named by exactly one task, never several.
+- consumes_contracts: the type_name of every frozen interface this task needs but does not \
+declare itself - normally owned by one of its depends_on.
 
 Your task list is what actually gets executed: each task becomes a real implementation step, \
 followed by a real `dotnet build` of its component. Nothing else implements anything. Work \
@@ -91,10 +114,13 @@ exists - typically when it references a type, interface or DTO the other task de
 not add dependencies to express a preferred order, and do not rely on the order you list \
 tasks in: it is ignored. Name only ids you also produced, and do not create a cycle.
 
-A task's component may repeat: several tasks can target the same project. Prefer one task \
-per project unless the project is large enough that splitting it genuinely lets independent \
-work proceed in parallel - two tasks writing to the same project run against the same files, \
-and a task that depends on that project must depend on all of them."""
+A task's component may repeat: several tasks can target the same project. A task should own \
+one cohesive concern - typically the implementation of one frozen interface, or a small group \
+of tightly related ones - not "whatever else this project needs." Splitting a project into \
+several tasks is expected whenever its frozen interfaces are logically separable concerns, \
+regardless of whether splitting also happens to enable parallelism: cohesion, not just \
+concurrency, is the reason to split. Two tasks targeting the same project still run against \
+the same files, and a task that depends on that project must depend on all of its tasks."""
 
 
 def register_prompts(registry: PromptRegistry) -> None:

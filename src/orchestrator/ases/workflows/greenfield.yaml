@@ -236,7 +236,7 @@ nodes:
 
   - id: impl_end
     kind: barrier
-    join: all # impl_start AND every admitted build:<task> must have succeeded
+    join: all # impl_start AND every admitted build:<component> must have succeeded
 
   - id: migration
     kind: agent

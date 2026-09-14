@@ -25,6 +25,7 @@ from uuid import uuid4
 import pytest
 
 import ases
+from ases.agents.decompose import PROMPT_VERSION as DECOMPOSE_PROMPT_VERSION
 from ases.agents.implementer import PROMPT_VERSION as IMPLEMENTER_PROMPT_VERSION
 from ases.agents.migration import _MigrationProposal
 from ases.agents.scaffold import PROMPT_VERSION as SCAFFOLD_PROMPT_VERSION
@@ -58,6 +59,7 @@ from ases.kernel.state import NodeStatus, RunState, RunStatus
 from ases.kernel.store.jsonl import JsonlEventStore
 from ases.kernel.tools.dotnet import build_dotnet_tools
 from ases.kernel.tools.fs import READ_FILE, WRITE_FILE
+from ases.kernel.tools.git import build_git_tools
 from ases.kernel.tools.migrations import MIGRATIONS_CLASSIFY, build_ef_migration_tools
 from ases.kernel.tools.registry import ToolRegistry
 from ases.kernel.tools.security import SCAN_FOR_SECRETS
@@ -96,6 +98,8 @@ def _build_tools(runner: _AlwaysSucceedsRunner) -> ToolRegistry:
     registry.register(CHECK_SOLUTION)
     registry.register(MIGRATIONS_CLASSIFY)
     for spec in build_dotnet_tools(runner):
+        registry.register(spec)
+    for spec in build_git_tools(runner):
         registry.register(spec)
     for spec in build_ef_migration_tools(runner):
         registry.register(spec)
@@ -155,6 +159,8 @@ def _script_responses(provider: MockProvider) -> None:
                 signature="public interface IUrlRepository { }",
                 namespace="UrlShortener.Application",
                 project="UrlShortener.Application",
+                type_name="IUrlRepository",
+                file_path="UrlShortener.Application/IUrlRepository.cs",
             ),
         ),
     )
@@ -230,7 +236,7 @@ def _script_responses(provider: MockProvider) -> None:
     # does, and a stale literal here fails every test in this module with
     # a mock-exhaustion error that says nothing about the real change.
     provider.respond_to(f"scaffold.plan@v{SCAFFOLD_PROMPT_VERSION}", ok(skeleton))
-    provider.respond_to("decompose.plan@v2", ok(tasks))
+    provider.respond_to(f"decompose.plan@v{DECOMPOSE_PROMPT_VERSION}", ok(tasks))
     for patch in (domain_patch, api_patch, infrastructure_patch):
         provider.respond_to(f"implementer.write@v{IMPLEMENTER_PROMPT_VERSION}", ok(patch))
     provider.respond_to("migration.plan@v1", ok(migration_proposal))
@@ -294,14 +300,19 @@ async def test_the_full_greenfield_graph_completes_end_to_end(tmp_path: Path) ->
         "decompose",
         "structure_check",
         # Admitted at runtime from the TaskGraph above - none of these node
-        # ids appears anywhere in greenfield.yaml.
+        # ids appears anywhere in greenfield.yaml. `build:`/`repair:` are
+        # keyed by component, not task id - each task here targets a
+        # distinct component, so there is still one of each.
         "impl_start",
         "impl:t-domain",
         "impl:t-infrastructure",
         "impl:t-api",
-        "build:t-domain",
-        "build:t-infrastructure",
-        "build:t-api",
+        "implready:UrlShortener.Domain",
+        "implready:UrlShortener.Infrastructure",
+        "implready:UrlShortener.Api",
+        "build:UrlShortener.Domain",
+        "build:UrlShortener.Infrastructure",
+        "build:UrlShortener.Api",
         "impl_end",
         "migration",
         "migration_apply",
@@ -322,9 +333,9 @@ async def test_the_full_greenfield_graph_completes_end_to_end(tmp_path: Path) ->
     # them (every build and every dotnet test succeeded first try).
     for repair_node_id in (
         "repair",
-        "repair:t-domain",
-        "repair:t-infrastructure",
-        "repair:t-api",
+        "repair:UrlShortener.Domain",
+        "repair:UrlShortener.Infrastructure",
+        "repair:UrlShortener.Api",
     ):
         assert (
             repair_node_id not in state.nodes
@@ -360,7 +371,18 @@ async def test_the_full_greenfield_graph_completes_end_to_end(tmp_path: Path) ->
         "UrlShortener.Infrastructure",
     ) in dotnet_runner.calls
     dotnet_build_calls = [c for c in dotnet_runner.calls if c[:2] == ("dotnet", "build")]
-    assert len(dotnet_build_calls) == 3  # one per implementation task
+    assert len(dotnet_build_calls) == 3  # one per component (each task here is its own component)
+    # Each build is scoped to its own component's project, not the whole
+    # solution - `agents/wiring.py`'s `_dotnet_build_args` decodes the
+    # component straight from the `build:<component>` node id
+    # (`planner.component_of`). A regression here (e.g. falling back to
+    # `planner.task_of`, which no longer resolves a build node's id at all
+    # now that `build`/`repair` are component-keyed) would silently degrade
+    # every one of these to an unscoped `dotnet build`, indistinguishable by
+    # call count alone - hence pinning the actual project argument too.
+    assert ("dotnet", "build", "UrlShortener.Domain", "-warnaserror") in dotnet_build_calls
+    assert ("dotnet", "build", "UrlShortener.Infrastructure", "-warnaserror") in dotnet_build_calls
+    assert ("dotnet", "build", "UrlShortener.Api", "-warnaserror") in dotnet_build_calls
     dotnet_test_calls = [c for c in dotnet_runner.calls if c[:2] == ("dotnet", "test")]
     assert len(dotnet_test_calls) == 1
     ef_add_calls = [c for c in dotnet_runner.calls if c[:3] == ("dotnet", "ef", "migrations")]

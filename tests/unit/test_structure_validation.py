@@ -15,9 +15,11 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
+from ases.contracts.artifacts import FrozenInterface, SolutionSkeleton, TaskGraph, TaskSpec
 from ases.kernel.tools.classification import SideEffect, ToolContext
 from ases.kernel.tools.registry import ToolRegistry
 from ases.validation.structure import (
+    check_contract_graph,
     check_reference_graph,
     project_name_of,
     references_in,
@@ -25,6 +27,16 @@ from ases.validation.structure import (
 from ases.validation.structure_tool import CHECK_SOLUTION
 
 LAYERS = ("Shop.Domain", "Shop.Application", "Shop.Infrastructure", "Shop.Api")
+
+
+def _interface(type_name: str, *, project: str, namespace: str | None = None) -> FrozenInterface:
+    return FrozenInterface(
+        signature=f"public interface {type_name} {{ }}",
+        namespace=namespace or project,
+        project=project,
+        type_name=type_name,
+        file_path=f"{project}/{type_name}.cs",
+    )
 
 
 def _csproj(*references: str) -> str:
@@ -143,6 +155,163 @@ def test_a_project_whose_csproj_cannot_be_read_is_skipped_not_reported() -> None
     assert report.ok
 
 
+# --- the contract graph -----------------------------------------------------
+
+
+def test_a_consistent_contract_graph_has_no_findings() -> None:
+    skeleton = SolutionSkeleton(
+        projects=LAYERS, frozen_interfaces=(_interface("IShopRepo", project="Shop.Application"),)
+    )
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="app",
+                description="repo interface",
+                component="Shop.Application",
+                produces_contracts=("IShopRepo",),
+            ),
+            TaskSpec(
+                id="infra",
+                description="repo impl",
+                component="Shop.Infrastructure",
+                depends_on=("app",),
+                consumes_contracts=("IShopRepo",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert report.ok
+
+
+def test_an_unknown_produced_contract_is_reported() -> None:
+    skeleton = SolutionSkeleton(projects=LAYERS)
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="app",
+                description="x",
+                component="Shop.Application",
+                produces_contracts=("IGhost",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["unknown_produced_contract"]
+    assert "IGhost" in report.findings[0].message
+
+
+def test_a_contract_produced_by_the_wrong_project_is_reported() -> None:
+    skeleton = SolutionSkeleton(
+        projects=LAYERS, frozen_interfaces=(_interface("IShopRepo", project="Shop.Application"),)
+    )
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="infra",
+                description="x",
+                component="Shop.Infrastructure",
+                produces_contracts=("IShopRepo",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["contract_project_mismatch"]
+
+
+def test_two_tasks_producing_the_same_contract_is_reported() -> None:
+    skeleton = SolutionSkeleton(
+        projects=LAYERS, frozen_interfaces=(_interface("IShopRepo", project="Shop.Application"),)
+    )
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="a",
+                description="x",
+                component="Shop.Application",
+                produces_contracts=("IShopRepo",),
+            ),
+            TaskSpec(
+                id="b",
+                description="y",
+                component="Shop.Application",
+                produces_contracts=("IShopRepo",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["duplicate_contract_producer"]
+    assert "'a'" in report.findings[0].message and "'b'" in report.findings[0].message
+
+
+def test_a_consumed_contract_with_no_producer_is_reported() -> None:
+    skeleton = SolutionSkeleton(
+        projects=LAYERS, frozen_interfaces=(_interface("IShopRepo", project="Shop.Application"),)
+    )
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="infra",
+                description="x",
+                component="Shop.Infrastructure",
+                consumes_contracts=("IShopRepo",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["contract_without_producer"]
+
+
+def test_an_unknown_consumed_contract_is_reported() -> None:
+    skeleton = SolutionSkeleton(projects=LAYERS)
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="infra",
+                description="x",
+                component="Shop.Infrastructure",
+                consumes_contracts=("IGhost",),
+            ),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["unknown_consumed_contract"]
+
+
+def test_consuming_a_contract_declared_in_a_later_project_is_reported() -> None:
+    """The contract-graph mirror of `inverted_dependency`: a consumer cannot
+    reach a producer the architecture declares after it."""
+    skeleton = SolutionSkeleton(
+        projects=LAYERS, frozen_interfaces=(_interface("IApiOnly", project="Shop.Api"),)
+    )
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="domain",
+                description="x",
+                component="Shop.Domain",
+                consumes_contracts=("IApiOnly",),
+            ),
+            TaskSpec(id="api", description="y", component="Shop.Api", produces_contracts=("IApiOnly",)),
+        )
+    )
+
+    report = check_contract_graph(task_graph=graph, skeleton=skeleton)
+
+    assert [f.rule for f in report.findings] == ["contract_reference_missing"]
+
+
 # --- the registered tool ---------------------------------------------------
 
 
@@ -209,6 +378,53 @@ async def test_the_tool_is_read_only_by_declaration() -> None:
     assert CHECK_SOLUTION.writable_paths == ()
     assert CHECK_SOLUTION.idempotent is True
     assert CHECK_SOLUTION.requires_approval is False
+
+
+async def test_the_tool_ignores_the_contract_check_when_no_task_graph_is_given(
+    tmp_path: Path,
+) -> None:
+    """Purely additive: a caller with no task graph yet gets exactly the old
+    reference-graph-only behaviour."""
+    _write_solution(tmp_path, {"Shop.Domain": []})
+    registry = ToolRegistry()
+    registry.register(CHECK_SOLUTION)
+
+    result = await registry.invoke(
+        "structure.check_solution",
+        {"projects": ["Shop.Domain"]},
+        ToolContext(cwd=PurePosixPath(tmp_path.as_posix()), run_id=str(uuid4()), node_id="sc"),
+    )
+
+    assert result.ok
+
+
+async def test_the_tool_also_fails_on_a_contract_graph_problem(tmp_path: Path) -> None:
+    _write_solution(tmp_path, {"Shop.Domain": [], "Shop.Application": ["Shop.Domain"]})
+    registry = ToolRegistry()
+    registry.register(CHECK_SOLUTION)
+    graph = TaskGraph(
+        tasks=(
+            TaskSpec(
+                id="app",
+                description="x",
+                component="Shop.Application",
+                consumes_contracts=("IGhost",),
+            ),
+        )
+    )
+
+    result = await registry.invoke(
+        "structure.check_solution",
+        {
+            "projects": ["Shop.Domain", "Shop.Application"],
+            "tasks": [t.model_dump(mode="json") for t in graph.tasks],
+            "frozen_interfaces": [],
+        },
+        ToolContext(cwd=PurePosixPath(tmp_path.as_posix()), run_id=str(uuid4()), node_id="sc"),
+    )
+
+    assert not result.ok
+    assert "unknown_consumed_contract" in (result.error or "")
 
 
 async def test_the_tool_says_so_when_there_is_nothing_to_check(tmp_path: Path) -> None:

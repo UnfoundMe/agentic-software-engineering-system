@@ -42,6 +42,7 @@ from ases.kernel.store.bootstrap import reset_workload as run_reset_workload
 from ases.kernel.store.postgres import PostgresEventStore
 from ases.kernel.tools.dotnet import build_dotnet_tools
 from ases.kernel.tools.fs import READ_FILE, WRITE_FILE
+from ases.kernel.tools.git import build_git_tools
 from ases.kernel.tools.migrations import MIGRATIONS_CLASSIFY, build_ef_migration_tools
 from ases.kernel.tools.registry import ToolRegistry
 from ases.kernel.tools.security import SCAN_FOR_SECRETS
@@ -120,6 +121,8 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(CHECK_SOLUTION)
     registry.register(MIGRATIONS_CLASSIFY)
     for spec in build_dotnet_tools():
+        registry.register(spec)
+    for spec in build_git_tools():
         registry.register(spec)
     for spec in build_ef_migration_tools():
         registry.register(spec)

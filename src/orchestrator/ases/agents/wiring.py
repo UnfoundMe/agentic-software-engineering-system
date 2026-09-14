@@ -31,8 +31,8 @@ from ases.agents.migration import MigrationAgent, ef_targets
 from ases.agents.migration import register_prompts as register_migration_prompts
 from ases.agents.planner import (
     TaskGraphSubgraphProvider,
+    component_of,
     implementation_patches,
-    task_of,
 )
 from ases.agents.release import ReleaseAgent
 from ases.agents.release import register_prompts as register_release_prompts
@@ -47,7 +47,7 @@ from ases.agents.tester import register_prompts as register_tester_prompts
 from ases.agents.tool_executor import ToolNodeExecutor
 from ases.context.lineage import UnknownArtifactError
 from ases.context.retriever import ContextRetriever, NoArtifactFromNodeError
-from ases.contracts.artifacts import SolutionSkeleton
+from ases.contracts.artifacts import SolutionSkeleton, TaskGraph
 from ases.kernel.failures import FailureKind
 from ases.kernel.graph import NodeSpec
 from ases.kernel.scheduler import NodeExecutor
@@ -119,24 +119,37 @@ def _skeleton_from(retriever: ContextRetriever) -> SolutionSkeleton | None:
 
 
 def _dotnet_build_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
-    """The project one `build:<task>` node compiles.
+    """The project one `build:<component>` node compiles.
 
-    One handler for every build node in the run, resolving its project from
-    the task the node belongs to (`planner.task_of`) rather than from a
-    closure fixed at wiring time. There used to be three of these -
+    One handler for every build node in the run, resolving its project
+    directly from the node's own id (`planner.component_of`) rather than from
+    a closure fixed at wiring time. There used to be three of these -
     `_build_domain_args`, `_build_api_args`, `_build_infrastructure_args` -
     each finding its project by matching a suffix (`.domain`, `.api`,
     `.infrastructure`) against `SolutionSkeleton.projects`. That is the
     name-based inference this system is not supposed to route on, and it
     could only ever name the three layers someone had written a builder for.
 
-    Falls back to an unscoped `dotnet build` (the whole solution) when the
-    node is not a generated task node or the task graph cannot be read - the
-    same conservative default the old builders used with no skeleton."""
-    task = task_of(retriever.state, node.id)
-    if task is None or not task.component:
+    This used to go through `planner.task_of(retriever.state, node.id)`
+    instead - correct while `build:<task>` was task-keyed, but
+    `agents/planner.py`'s move to one `build:<component>` node per component
+    (not per task) means `task_of`/`task_id_of` no longer resolve a build
+    node's id at all (they only decode `impl:<task>`); left unchanged, this
+    would have silently returned `{}` for every build node and fallen back to
+    building the *whole solution* on every pass - functionally fine but
+    defeating the entire point of scoping a build to its own project (see
+    `kernel/tools/dotnet.py`'s `dotnet_build`, which documents why an
+    unscoped build was made scoped in the first place). `component_of` reads
+    the component the node id itself already encodes, no `TaskGraph` lookup
+    needed.
+
+    Falls back to an unscoped `dotnet build` (the whole solution) only when
+    the node is not a generated build node at all - the same conservative
+    default the old builders used with no skeleton."""
+    component = component_of(node.id)
+    if not component:
         return {}
-    return {"project": task.component}
+    return {"project": component}
 
 
 def _ef_database_update_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
@@ -152,15 +165,32 @@ def _ef_database_update_args(retriever: ContextRetriever, node: NodeSpec) -> Map
     return {"project": project, "startup_project": startup_project}
 
 
+def _task_graph_from(retriever: ContextRetriever) -> TaskGraph | None:
+    try:
+        graph = retriever.fetch_latest_from("decompose")
+    except (NoArtifactFromNodeError, UnknownArtifactError):
+        return None
+    return graph if isinstance(graph, TaskGraph) else None
+
+
 def _structure_check_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
     """The scaffolded project list, in the dependency order the architecture
-    declared - which is the only architectural input the structural check
-    takes. See `validation/structure.py` on why it is expressed that way
-    rather than as named layers."""
+    declared, plus the decomposer's task graph and the scaffold's frozen
+    interfaces - together the only inputs `structure.check_solution` needs
+    for both its checks: `check_reference_graph` (project-reference
+    direction, from `projects`) and `check_contract_graph` (contract linkage,
+    from `tasks`/`frozen_interfaces`). See `validation/structure.py` on why
+    projects are expressed this way rather than as named layers, and why the
+    contract check takes structured data rather than reading source."""
     skeleton = _skeleton_from(retriever)
     if skeleton is None:
         return {}
-    return {"projects": list(skeleton.projects)}
+    args: dict[str, object] = {"projects": list(skeleton.projects)}
+    task_graph = _task_graph_from(retriever)
+    if task_graph is not None:
+        args["tasks"] = [t.model_dump(mode="json") for t in task_graph.tasks]
+        args["frozen_interfaces"] = [i.model_dump(mode="json") for i in skeleton.frozen_interfaces]
+    return args
 
 
 def _scan_artifact(output: Mapping[str, object]) -> Mapping[str, object] | None:

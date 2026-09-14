@@ -25,7 +25,9 @@ from ases.agents.planner import (
     SubgraphPlanError,
     TaskGraphSubgraphProvider,
     build_node_id,
+    component_of,
     impl_node_id,
+    impl_ready_node_id,
     implementation_node_ids,
     repair_node_id,
     task_id_of,
@@ -91,9 +93,23 @@ FOUR_LAYER_SKELETON = SolutionSkeleton(
             signature="public interface IShortLinkRepository { }",
             namespace="Shop.Application",
             project="Shop.Application",
+            type_name="IShortLinkRepository",
+            file_path="Shop.Application/IShortLinkRepository.cs",
         ),
     ),
 )
+
+
+#: `FOUR_LAYER_TASKS` has one task per component, task id != component name
+#: (e.g. task `"application"` targets component `"Shop.Application"`) - this
+#: is what a build/repair-node-id test must key off, since `build_node_id`/
+#: `repair_node_id` are keyed by *component*, not task id.
+COMPONENT_OF = {
+    "domain": "Shop.Domain",
+    "application": "Shop.Application",
+    "infrastructure": "Shop.Infrastructure",
+    "api": "Shop.Api",
+}
 
 
 def _state_with(tasks: TaskGraph, skeleton: SolutionSkeleton | None) -> RunState:
@@ -239,14 +255,17 @@ def test_each_task_becomes_an_implement_build_repair_triple() -> None:
     )
     assert proposal is not None
     ids = {n.id for n in proposal.nodes}
-    for task_id in ("domain", "application", "infrastructure", "api"):
-        assert {impl_node_id(task_id), build_node_id(task_id), repair_node_id(task_id)} <= ids
-    assert task_id_of("build:application") == "application"
+    for task_id, component in COMPONENT_OF.items():
+        assert impl_node_id(task_id) in ids
+        assert {build_node_id(component), repair_node_id(component)} <= ids
+    assert component_of("build:Shop.Application") == "Shop.Application"
+    assert task_id_of("build:Shop.Application") is None
 
 
 def test_a_dependency_becomes_an_edge_from_the_dependency_s_build() -> None:
-    """From `build:D`, not `impl:D`: waiting on the implementation only
-    proves the files were written, waiting on the build proves they compile."""
+    """From `build:<component>`, not `impl:<task>`: waiting on the
+    implementation only proves the files were written, waiting on the build
+    proves they compile."""
     proposal = TaskGraphSubgraphProvider().propose(
         _decompose_node(), _state_with(FOUR_LAYER_TASKS, FOUR_LAYER_SKELETON)
     )
@@ -254,7 +273,76 @@ def test_a_dependency_becomes_an_edge_from_the_dependency_s_build() -> None:
     incoming = {
         (e.source, e.target) for e in proposal.edges if e.target == impl_node_id("infrastructure")
     }
-    assert incoming == {(build_node_id("application"), impl_node_id("infrastructure"))}
+    assert incoming == {
+        (build_node_id("Shop.Application"), impl_node_id("infrastructure")),
+    }
+
+
+#: Live runs `8586c7f8-...` and `b88e6492-...`: a task explicitly
+#: `depends_on` another task in its *own* component (`app-usecases` on
+#: `app-ports`, both `Shop.Application`). Both runs got past every static
+#: workflow phase and then halted with "the run is stuck" once every task
+#: this plan admits was pending - see the two tests below for why.
+SAME_COMPONENT_DEPENDENCY_TASKS = TaskGraph(
+    tasks=(
+        TaskSpec(id="domain", description="entities", component="Shop.Domain"),
+        TaskSpec(
+            id="app-ports",
+            description="interfaces",
+            component="Shop.Application",
+            depends_on=("domain",),
+        ),
+        TaskSpec(
+            id="app-usecases",
+            description="handlers",
+            component="Shop.Application",
+            depends_on=("domain", "app-ports"),
+        ),
+    )
+)
+
+SAME_COMPONENT_DEPENDENCY_SKELETON = SolutionSkeleton(projects=("Shop.Domain", "Shop.Application"))
+
+
+def test_a_same_component_dependency_does_not_wait_on_its_own_component_s_build() -> None:
+    """The bug, pinned directly: `app-usecases` depends on `app-ports`,
+    which targets the *same* component. That must not become an edge from
+    `build:Shop.Application`, because that build cannot succeed until
+    `app-usecases` itself has - `impl:app-usecases` -> `implready` ->
+    `build:Shop.Application` -> `impl:app-usecases` is a cycle. The
+    dependency is still honoured, just through the write-lock's
+    `impl:app-ports -> impl:app-usecases` edge instead."""
+    proposal = TaskGraphSubgraphProvider().propose(
+        _decompose_node(),
+        _state_with(SAME_COMPONENT_DEPENDENCY_TASKS, SAME_COMPONENT_DEPENDENCY_SKELETON),
+    )
+    assert proposal is not None
+    incoming = {
+        (e.source, e.target) for e in proposal.edges if e.target == impl_node_id("app-usecases")
+    }
+    assert incoming == {
+        (build_node_id("Shop.Domain"), impl_node_id("app-usecases")),
+        (impl_node_id("app-ports"), impl_node_id("app-usecases")),
+    }
+    assert (build_node_id("Shop.Application"), impl_node_id("app-usecases")) not in incoming
+
+
+def test_the_same_component_dependency_proposal_is_a_valid_acyclic_graph(
+    greenfield_graph: WorkflowGraph,
+) -> None:
+    """`with_subgraph` rejects any candidate containing a cycle - this is
+    the check that would have refused live runs `8586c7f8-...`/
+    `b88e6492-...`'s plan outright, at admission, instead of admitting it
+    and only discovering the deadlock once every other node was stuck."""
+    proposal = TaskGraphSubgraphProvider().propose(
+        _decompose_node(),
+        _state_with(SAME_COMPONENT_DEPENDENCY_TASKS, SAME_COMPONENT_DEPENDENCY_SKELETON),
+    )
+    assert proposal is not None
+
+    admitted = greenfield_graph.with_subgraph(proposal.nodes, proposal.edges)
+
+    assert impl_node_id("app-usecases") in admitted.by_id
 
 
 def test_the_proposal_is_accepted_by_the_real_greenfield_graph(
@@ -271,10 +359,12 @@ def test_the_proposal_is_accepted_by_the_real_greenfield_graph(
     admitted = greenfield_graph.with_subgraph(proposal.nodes, proposal.edges)
 
     assert impl_node_id("application") in admitted.by_id
-    # Every build feeds the barrier that gates the rest of the lifecycle.
-    for task_id in ("domain", "application", "infrastructure", "api"):
+    # Every component's build feeds the barrier that gates the rest of the
+    # lifecycle.
+    for component in set(COMPONENT_OF.values()):
         assert any(
-            e.source == build_node_id(task_id) and e.target == "impl_end" for e in admitted.edges
+            e.source == build_node_id(component) and e.target == "impl_end"
+            for e in admitted.edges
         )
 
 
@@ -363,11 +453,14 @@ def _execution_stage_graph() -> WorkflowGraph:
 
 
 class _SkeletonExecutor:
+    def __init__(self, skeleton: SolutionSkeleton = FOUR_LAYER_SKELETON) -> None:
+        self._skeleton = skeleton
+
     async def execute(self, node: NodeSpec, state: RunState) -> NodeExecutionOutcome:
         return NodeExecutionOutcome(
             ok=True,
             artifact_kind="SolutionSkeleton",
-            artifact_payload=FOUR_LAYER_SKELETON.model_dump(mode="json"),
+            artifact_payload=self._skeleton.model_dump(mode="json"),
         )
 
 
@@ -375,11 +468,12 @@ async def _run_stage(
     tmp_path: Path,
     *,
     tasks: TaskGraph = FOUR_LAYER_TASKS,
+    skeleton: SolutionSkeleton = FOUR_LAYER_SKELETON,
     fail_nodes: frozenset[str] = frozenset(),
 ) -> tuple[RunState, _RecordingExecutor, JsonlEventStore]:
     worker = _RecordingExecutor(fail_nodes)
     executors: dict[str, NodeExecutor] = {
-        "scaffold": _SkeletonExecutor(),
+        "scaffold": _SkeletonExecutor(skeleton),
         "decompose": _DecomposeExecutor(tasks),
         "implementer": worker,
         "dotnet_build": worker,
@@ -399,9 +493,9 @@ async def test_the_whole_plan_executes_and_the_run_completes(tmp_path: Path) -> 
     state, _, _ = await _run_stage(tmp_path)
 
     assert state.status is RunStatus.COMPLETED
-    for task_id in ("domain", "application", "infrastructure", "api"):
+    for task_id, component in COMPONENT_OF.items():
         assert state.nodes[impl_node_id(task_id)].status is NodeStatus.SUCCEEDED
-        assert state.nodes[build_node_id(task_id)].status is NodeStatus.SUCCEEDED
+        assert state.nodes[build_node_id(component)].status is NodeStatus.SUCCEEDED
 
 
 async def test_a_dependent_task_never_starts_before_its_dependency_has_built(
@@ -412,9 +506,11 @@ async def test_a_dependent_task_never_starts_before_its_dependency_has_built(
     _, worker, _ = await _run_stage(tmp_path)
     order = worker.started
 
-    assert order.index(build_node_id("domain")) < order.index(impl_node_id("application"))
-    assert order.index(build_node_id("application")) < order.index(impl_node_id("infrastructure"))
-    assert order.index(build_node_id("application")) < order.index(impl_node_id("api"))
+    assert order.index(build_node_id("Shop.Domain")) < order.index(impl_node_id("application"))
+    assert order.index(build_node_id("Shop.Application")) < order.index(
+        impl_node_id("infrastructure")
+    )
+    assert order.index(build_node_id("Shop.Application")) < order.index(impl_node_id("api"))
 
 
 async def test_infrastructure_cannot_start_before_the_application_layer_exists(
@@ -432,7 +528,7 @@ async def test_infrastructure_cannot_start_before_the_application_layer_exists(
         if e.type in (EventType.NODE_STARTED, EventType.NODE_SUCCEEDED)
     }
 
-    application_built = seq_of[(EventType.NODE_SUCCEEDED, build_node_id("application"))]
+    application_built = seq_of[(EventType.NODE_SUCCEEDED, build_node_id("Shop.Application"))]
     infrastructure_started = seq_of[(EventType.NODE_STARTED, impl_node_id("infrastructure"))]
     assert application_built < infrastructure_started
 
@@ -475,11 +571,191 @@ async def test_a_strictly_linear_plan_never_runs_two_things_at_once(tmp_path: Pa
     assert worker.max_concurrent == 1
 
 
+# --- same-project build/repair consolidation --------------------------------
+#
+# Live run `91229361-...`: three tasks (`infra-persistence`, `infra-cache`,
+# `infra-codegen-clock`) all targeting `UrlShortener.Infrastructure` produced
+# three redundant `dotnet build UrlShortener.Infrastructure` runs and up to
+# three independent repair agents rewriting one project off one diagnostic.
+# These pin the fix: exactly one build/repair pair per component, regardless
+# of how many tasks target it.
+
+THREE_TASKS_ONE_COMPONENT = TaskGraph(
+    tasks=(
+        TaskSpec(id="infra-a", description="persistence", component="Shop.Infrastructure"),
+        TaskSpec(id="infra-b", description="cache", component="Shop.Infrastructure"),
+        TaskSpec(id="infra-c", description="codegen", component="Shop.Infrastructure"),
+    )
+)
+
+
+def test_exactly_one_build_and_repair_node_exists_per_component() -> None:
+    proposal = TaskGraphSubgraphProvider().propose(
+        _decompose_node(),
+        _state_with(
+            THREE_TASKS_ONE_COMPONENT,
+            SolutionSkeleton(projects=("Shop.Infrastructure",)),
+        ),
+    )
+    assert proposal is not None
+    ids = [n.id for n in proposal.nodes]
+
+    assert ids.count(build_node_id("Shop.Infrastructure")) == 1
+    assert ids.count(repair_node_id("Shop.Infrastructure")) == 1
+    assert ids.count(impl_ready_node_id("Shop.Infrastructure")) == 1
+    for task in THREE_TASKS_ONE_COMPONENT.tasks:
+        assert impl_node_id(task.id) in ids
+
+
+THREE_TASKS_ONE_COMPONENT_SKELETON = SolutionSkeleton(projects=("Shop.Infrastructure",))
+
+
+async def test_a_shared_build_waits_for_every_task_in_the_component(tmp_path: Path) -> None:
+    state, worker, _ = await _run_stage(
+        tmp_path,
+        tasks=THREE_TASKS_ONE_COMPONENT,
+        skeleton=THREE_TASKS_ONE_COMPONENT_SKELETON,
+    )
+
+    assert state.status is RunStatus.COMPLETED
+    build_index = worker.started.index(build_node_id("Shop.Infrastructure"))
+    for task in THREE_TASKS_ONE_COMPONENT.tasks:
+        assert worker.started.index(impl_node_id(task.id)) < build_index
+    # The build ran exactly once for all three tasks, not once each.
+    assert worker.started.count(build_node_id("Shop.Infrastructure")) == 1
+
+
+async def test_a_shared_build_failure_dispatches_exactly_one_repair(tmp_path: Path) -> None:
+    """A build that fails once (then compiles after repair) triggers exactly
+    one repair - not one per task that happened to target the component."""
+    worker = _FirstAttemptFailsExecutor(fail_once=frozenset({build_node_id("Shop.Infrastructure")}))
+    executors: dict[str, NodeExecutor] = {
+        "scaffold": _SkeletonExecutor(THREE_TASKS_ONE_COMPONENT_SKELETON),
+        "decompose": _DecomposeExecutor(THREE_TASKS_ONE_COMPONENT),
+        "implementer": worker,
+        "dotnet_build": worker,
+    }
+    store = JsonlEventStore(tmp_path / "events", fsync=False)
+    await Scheduler(
+        _execution_stage_graph(),
+        store,
+        executors,
+        entry_gate=BudgetEntryGate(GENEROUS),
+        subgraphs=TaskGraphSubgraphProvider(),
+    ).run(uuid4())
+
+    assert worker.started.count(repair_node_id("Shop.Infrastructure")) == 1
+
+
+class _FirstAttemptFailsExecutor(_RecordingExecutor):
+    """Like `_RecordingExecutor`, but a node named in `fail_once` only fails
+    its *first* dispatch and succeeds on every later one - the "repair
+    fixed it" shape `_RecordingExecutor`'s permanent `fail_nodes` cannot
+    express."""
+
+    def __init__(self, fail_once: frozenset[str]) -> None:
+        super().__init__()
+        self._fail_once = fail_once
+        self._seen: set[str] = set()
+
+    async def execute(self, node: NodeSpec, state: RunState) -> NodeExecutionOutcome:
+        first_time = node.id in self._fail_once and node.id not in self._seen
+        self._seen.add(node.id)
+        if first_time:
+            self.started.append(node.id)
+            return NodeExecutionOutcome(
+                ok=False,
+                failure_kind=FailureKind.BUILD_FAILURE,
+                error="error CS0246: type or namespace not found",
+            )
+        return await super().execute(node, state)
+
+
+async def test_a_repair_success_triggers_exactly_one_rebuild(tmp_path: Path) -> None:
+    worker = _FirstAttemptFailsExecutor(fail_once=frozenset({build_node_id("Shop.Infrastructure")}))
+    executors: dict[str, NodeExecutor] = {
+        "scaffold": _SkeletonExecutor(THREE_TASKS_ONE_COMPONENT_SKELETON),
+        "decompose": _DecomposeExecutor(THREE_TASKS_ONE_COMPONENT),
+        "implementer": worker,
+        "dotnet_build": worker,
+    }
+    store = JsonlEventStore(tmp_path / "events", fsync=False)
+    state = await Scheduler(
+        _execution_stage_graph(),
+        store,
+        executors,
+        entry_gate=BudgetEntryGate(GENEROUS),
+        subgraphs=TaskGraphSubgraphProvider(),
+    ).run(uuid4())
+
+    assert state.status is RunStatus.COMPLETED
+    # The original failing attempt, then exactly one rebuild after repair -
+    # not one rebuild per task that happened to target the component.
+    assert worker.started.count(build_node_id("Shop.Infrastructure")) == 2
+    assert worker.started.count(repair_node_id("Shop.Infrastructure")) == 1
+    assert state.nodes[build_node_id("Shop.Infrastructure")].status is NodeStatus.SUCCEEDED
+
+
+async def test_same_component_tasks_never_run_concurrently(tmp_path: Path) -> None:
+    """The write lock (`_same_component_predecessors`) is the only thing
+    preventing two tasks that write into the same project from racing on
+    the same compilation unit's files - see live run `91229361-...` in the
+    module docstring. Consolidating build/repair to one per component must
+    not weaken it: even with no declared dependency between them, three
+    tasks sharing a component still dispatch one at a time."""
+    _, worker, _ = await _run_stage(
+        tmp_path,
+        tasks=THREE_TASKS_ONE_COMPONENT,
+        skeleton=THREE_TASKS_ONE_COMPONENT_SKELETON,
+    )
+
+    assert worker.max_concurrent == 1
+
+
+async def test_a_same_component_dependency_completes_without_deadlock(tmp_path: Path) -> None:
+    """The live failure (`8586c7f8-...`/`b88e6492-...`), executed rather than
+    just inspected: before the fix, this plan admitted a cycle and the run
+    halted with every implementation task still pending."""
+    state, worker, _ = await _run_stage(
+        tmp_path,
+        tasks=SAME_COMPONENT_DEPENDENCY_TASKS,
+        skeleton=SAME_COMPONENT_DEPENDENCY_SKELETON,
+    )
+
+    assert state.status is RunStatus.COMPLETED
+    # The declared same-component dependency is still honoured as ordering,
+    # not just quietly dropped along with the cyclic edge.
+    assert worker.started.index(impl_node_id("app-ports")) < worker.started.index(
+        impl_node_id("app-usecases")
+    )
+    assert state.nodes[build_node_id("Shop.Application")].status is NodeStatus.SUCCEEDED
+
+
+async def test_cross_component_tasks_still_run_concurrently(tmp_path: Path) -> None:
+    """Consolidation must not become global serialization: two independent
+    components with no dependency between them still dispatch together."""
+    two_components = TaskGraph(
+        tasks=(
+            TaskSpec(id="a", description="x", component="Shop.Domain"),
+            TaskSpec(id="b", description="y", component="Shop.Application"),
+        )
+    )
+    _, worker, _ = await _run_stage(
+        tmp_path,
+        tasks=two_components,
+        skeleton=SolutionSkeleton(projects=("Shop.Domain", "Shop.Application")),
+    )
+
+    assert worker.max_concurrent >= 2
+
+
 async def test_a_failed_task_build_stops_the_execution_stage(tmp_path: Path) -> None:
     """`impl_end` joins `all` over every admitted build, so one build that
     never goes green cannot let the run reach the rest of the lifecycle -
     the same property the static graph had, preserved by construction."""
-    state, _, _ = await _run_stage(tmp_path, fail_nodes=frozenset({build_node_id("application")}))
+    state, _, _ = await _run_stage(
+        tmp_path, fail_nodes=frozenset({build_node_id("Shop.Application")})
+    )
 
     assert state.status is not RunStatus.COMPLETED
     assert state.status_of("impl_end") is NodeStatus.PENDING
@@ -489,12 +765,14 @@ async def test_a_failed_task_build_stops_the_execution_stage(tmp_path: Path) -> 
     assert state.status_of(impl_node_id("api")) is NodeStatus.PENDING
 
 
-async def test_a_failed_build_routes_to_that_task_s_own_repair(tmp_path: Path) -> None:
-    _, worker, _ = await _run_stage(tmp_path, fail_nodes=frozenset({build_node_id("application")}))
+async def test_a_failed_build_routes_to_that_component_s_own_repair(tmp_path: Path) -> None:
+    _, worker, _ = await _run_stage(
+        tmp_path, fail_nodes=frozenset({build_node_id("Shop.Application")})
+    )
 
-    assert repair_node_id("application") in worker.started
-    # Scoped: a sibling task's repair position was never dispatched.
-    assert repair_node_id("domain") not in worker.started
+    assert repair_node_id("Shop.Application") in worker.started
+    # Scoped: a sibling component's repair position was never dispatched.
+    assert repair_node_id("Shop.Domain") not in worker.started
 
 
 # --- admission is recorded, and survives a resume --------------------------
@@ -531,7 +809,7 @@ async def test_a_resumed_run_rebuilds_the_subgraph_it_was_executing(tmp_path: Pa
 
     assert state_again.status is RunStatus.COMPLETED
     assert impl_node_id("application") in resumed.graph.by_id
-    assert build_node_id("api") in resumed.graph.by_id
+    assert build_node_id("Shop.Api") in resumed.graph.by_id
 
 
 async def test_a_rejected_proposal_fails_the_proposing_node_and_admits_nothing(
@@ -601,15 +879,24 @@ async def test_every_admitted_task_s_code_is_visible_to_downstream_agents(
         assert impl_node_id(task_id) in seen
 
 
-async def test_a_build_node_resolves_its_project_from_its_task(tmp_path: Path) -> None:
+async def test_a_build_node_resolves_its_project_from_its_own_node_id(tmp_path: Path) -> None:
     """One `dotnet_build` handler serves every build node; it finds the
-    project to compile through the task, never by matching a suffix against
-    a project name."""
+    project to compile directly from the node id (`build:<component>`),
+    never by matching a suffix against a project name, and no longer needs a
+    `TaskGraph` lookup at all now that the node id *is* the component."""
+    await _run_stage(tmp_path)
+
+    assert component_of(build_node_id("Shop.Application")) == "Shop.Application"
+    assert component_of("impl_start") is None
+
+
+async def test_task_of_does_not_resolve_a_build_or_repair_node(tmp_path: Path) -> None:
+    """`task_of` is for `impl:<task>` nodes only - a `build:`/`repair:` node
+    spans however many tasks target that component, not one (see
+    `tasks_of_component`)."""
     state, _, _ = await _run_stage(tmp_path)
 
-    task = task_of(state, build_node_id("application"))
-    assert task is not None
-    assert task.component == "Shop.Application"
+    assert task_of(state, build_node_id("Shop.Application")) is None
     assert task_of(state, "impl_start") is None
 
 
@@ -630,7 +917,9 @@ def test_edges_into_a_task_carry_no_condition_other_than_the_repair_pair() -> No
         source.startswith("build:") and target.startswith("repair:")
         for source, target in by_condition[EdgeCondition.ON_FAILURE]
     )
-    assert (repair_node_id("api"), build_node_id("api")) in by_condition[EdgeCondition.ON_SUCCESS]
+    assert (repair_node_id("Shop.Api"), build_node_id("Shop.Api")) in by_condition[
+        EdgeCondition.ON_SUCCESS
+    ]
 
 
 # --- decompose is recoverable -----------------------------------------------

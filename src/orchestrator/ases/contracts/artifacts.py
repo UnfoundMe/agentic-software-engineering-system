@@ -15,6 +15,7 @@ L1 schema validation (docs/05 section 6) has something real to check against.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 
 from pydantic import Field, model_validator
@@ -132,6 +133,12 @@ class FrozenInterface(ArtifactModel):
     `namespace` is what the compiler actually resolves against, so it is
     required. `project` says which assembly declares it, which is what tells
     a consumer whether it needs a `ProjectReference` at all.
+
+    `type_name` and `file_path` were added for the same reason, one layer up:
+    `TaskSpec.produces_contracts`/`consumes_contracts` (below) link a task to
+    the interfaces it owns or needs by name, and a repair prompt needs to
+    name the file a failure actually involves without parsing compiler
+    output - both need a value distinct from the free-text `signature`.
     """
 
     #: The C# signature, e.g. `public interface IShortLinkCache { ... }`.
@@ -143,6 +150,17 @@ class FrozenInterface(ArtifactModel):
     namespace: str = Field(min_length=1)
     #: The project whose assembly contains it.
     project: str = Field(min_length=1)
+    #: The bare type/interface name alone, e.g. `IShortLinkCache` - no
+    #: namespace prefix. What `TaskSpec.produces_contracts`/`consumes_contracts`
+    #: name to link a task to this interface, since matching on the full
+    #: `signature` string would be fragile (whitespace, modifiers, generic
+    #: parameters all vary text that names the same type).
+    type_name: str = Field(min_length=1)
+    #: Where the type is expected to live, e.g.
+    #: `UrlShortener.Application/IShortLinkCache.cs` - relative to the
+    #: solution root, the same convention `agents/implementer.py`'s prompt
+    #: already uses for a `FileChange.path`.
+    file_path: str = Field(min_length=1)
 
 
 class SolutionSkeleton(ArtifactModel):
@@ -164,18 +182,40 @@ class SolutionSkeleton(ArtifactModel):
     #: type its dependency declared actually lives. See `FrozenInterface`.
     frozen_interfaces: tuple[FrozenInterface, ...] = ()
 
-    def frozen_interface_block(self) -> str:
+    @model_validator(mode="after")
+    def _type_names_are_unique(self) -> SolutionSkeleton:
+        names = [i.type_name for i in self.frozen_interfaces]
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate frozen interface type_name(s): {duplicates}")
+        return self
+
+    def frozen_interface_block(self, type_names: Collection[str] | None = None) -> str:
         """The frozen contract as a prompt-ready block, grouped by namespace.
 
         Rendering lives here rather than in each agent because `decompose`
         and `implementer` must show the model the *same* contract - one of
         them quietly dropping the namespace is the failure this type exists
         to prevent.
+
+        `type_names`, when given, renders only the interfaces named -
+        `agents/implementer.py` uses this to show a task the contracts it
+        actually produces/consumes (`TaskSpec.produces_contracts`/
+        `consumes_contracts`) instead of every frozen interface in the
+        solution, which would only grow the prompt as a solution gets more
+        tasks without making any one task's contract any clearer. `None`
+        (the default) renders everything, unchanged from before this
+        parameter existed - `agents/decompose.py` still wants the full
+        landscape to assign tasks against.
         """
-        if not self.frozen_interfaces:
+        interfaces = self.frozen_interfaces
+        if type_names is not None:
+            wanted = set(type_names)
+            interfaces = tuple(i for i in interfaces if i.type_name in wanted)
+        if not interfaces:
             return "(none stated)"
         by_namespace: dict[tuple[str, str], list[str]] = {}
-        for interface in self.frozen_interfaces:
+        for interface in interfaces:
             by_namespace.setdefault((interface.namespace, interface.project), []).append(
                 interface.signature
             )
@@ -219,6 +259,24 @@ class TaskSpec(ArtifactModel):
     #: this one starts. Explicit, never inferred from naming, folder layout
     #: or list order - see `TaskGraph`'s validator.
     depends_on: tuple[str, ...] = ()
+    #: File paths this task is expected to create or modify, relative to the
+    #: solution root (the same convention `agents/implementer.py`'s prompt
+    #: uses for a `FileChange.path`). Advisory, not enforced against what the
+    #: task actually writes - it exists so a decomposer states a task's scope
+    #: concretely enough to notice when one task is quietly covering several
+    #: independent files/concerns, and so a repair prompt can name the files
+    #: a component's failure involves without parsing compiler output.
+    files: tuple[str, ...] = ()
+    #: `FrozenInterface.type_name` values this task is responsible for
+    #: declaring. Links a task to `SolutionSkeleton.frozen_interfaces` from
+    #: the decompose side, since no `TaskSpec` exists yet when scaffold
+    #: populates that list - see `FrozenInterface`'s own docstring.
+    produces_contracts: tuple[str, ...] = ()
+    #: `FrozenInterface.type_name` values this task consumes - normally
+    #: produced by one of `depends_on`. `validation.structure.check_contract_graph`
+    #: checks every consumed contract actually has a producer somewhere in
+    #: the graph.
+    consumes_contracts: tuple[str, ...] = ()
 
 
 class TaskGraph(ArtifactModel):

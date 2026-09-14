@@ -19,39 +19,61 @@ executed it. A fourth hard-coded node would have fixed that one run and left
 the next architecture - `Web`/`Messaging`/`Worker`/`Persistence`, say - to
 fail the same way.
 
-**Shape admitted per task.** For task `T`, three nodes and four edges, plus
-one more per declared dependency::
+**`build`/`repair` are keyed by component, not by task.** One `impl:<task>`
+node exists per task, as always - each task authors its own files. But a
+project with several tasks (found live, `91229361-...`:
+`infra-persistence`/`infra-cache`/`infra-codegen-clock`, all
+`component: UrlShortener.Infrastructure`) used to get one `build:<task>` and
+one `repair:<task>` *per task* - three redundant `dotnet build
+UrlShortener.Infrastructure` runs claiming to answer the same question, and
+up to three repair agents independently rewriting one project off one
+diagnostic that only one of them actually caused. There is now exactly one
+`build:<component>`/`repair:<component>` pair per distinct component in the
+plan, fed by a barrier over every task targeting it::
 
-    impl:T ------> build:T --[on_failure]--> repair:T
-                      |   <--[on_success]-------'
-                      '---> impl_end
+    impl:A ─┐
+    impl:B ─┼─> implready:<component> --[on_success]--> build:<component>
+    impl:C ─┘                                                |    ^
+                                                   [on_failure]    |
+                                                               v    [on_success]
+                                                         repair:<component> ─┘
+                                                                |
+                                                                v
+                                                            impl_end
 
-    and for each dependency D:   build:D ------> impl:T
+    and for each task T with dependency D:   build:<component of D> ------> impl:T
 
-**Why the dependency edge comes from `build:D`, not `impl:D`.** Waiting on
-the dependency's *implementation* only proves its files were written;
-waiting on its *build* proves they compile. Infrastructure implementing
-`IShortLinkRepository` needs the Application project to contain that
-interface and to have compiled, or `build:infrastructure` fails on a type
-that was written but is not valid - a strictly worse failure to hand a
+`_same_component_predecessors` still serializes *implementation* dispatch for
+tasks sharing a component (unchanged - it is a different hazard: two tasks
+racing on the same compilation unit's files, orthogonal to how many times the
+project gets built). What changes here is only that the project now gets
+built, and repaired, exactly once regardless of how many tasks wrote to it.
+
+**Why the dependency edge comes from `build:<component>`, not `impl:<task>`.**
+Waiting on a dependency's *implementation* only proves its files were
+written; waiting on its *build* proves they compile. Infrastructure
+implementing `IShortLinkRepository` needs the Application project to contain
+that interface and to have compiled, or `build:Infrastructure` fails on a
+type that was written but is not valid - a strictly worse failure to hand a
 repair agent, since the fault is then in a project it has no business
 editing.
 
 **Where parallelism comes from.** Nowhere in this module: it emits edges,
 and `Scheduler._compute_ready` dispatches every ready node in one
-`asyncio.gather`. Two tasks with no path between them become ready in the
-same pass and genuinely run together; a task with unsatisfied dependency
-edges is not ready, so it waits. Ordering is a property of the edges the
-decomposer's `depends_on` produced - never of list order, task naming, or
-which node happened to finish first.
+`asyncio.gather`. Two tasks (or components) with no path between them become
+ready in the same pass and genuinely run together; a task with unsatisfied
+dependency edges is not ready, so it waits. Ordering is a property of the
+edges the decomposer's `depends_on` produced plus the same-component write
+lock - never of list order, task naming, or which node happened to finish
+first.
 
 **What the static YAML keeps.** `impl_start` and `impl_end`, two barriers.
 `impl_start -> impl_end` remains as a direct edge so the file is a valid
 graph on its own (`validate_graph` runs at load, before any task exists) and
 so an empty `TaskGraph` degrades to "no implementation work" rather than to
 a dangling graph. `impl_end` joins `all`, so it is satisfied only when
-`impl_start` *and* every admitted `build:T` have succeeded - which is also
-what keeps a failed build from letting the run past it.
+`impl_start` *and* every admitted `build:<component>` have succeeded - which
+is also what keeps a failed build from letting the run past it.
 """
 
 from __future__ import annotations
@@ -65,15 +87,22 @@ from ases.kernel.graph import Edge, EdgeCondition, JoinPolicy, NodeKind, NodeSpe
 from ases.kernel.scheduler import SubgraphProposal
 from ases.kernel.state import RunState
 
-#: Node-id prefixes for the three positions each task materializes into.
-#: A structural convention the *orchestrator* imposes on ids it generates
-#: itself - deliberately not an inference over model-authored names, which is
-#: the thing this module exists to stop doing. `agents/implementer.py` and
-#: `agents/wiring.py` parse ids back through `task_id_of`, never by matching
-#: substrings of a project name.
+#: Node-id prefixes. A structural convention the *orchestrator* imposes on
+#: ids it generates itself - deliberately not an inference over
+#: model-authored names, which is the thing this module exists to stop
+#: doing. `IMPL_PREFIX` is keyed by task id (one `impl:<task>` per task, each
+#: authoring its own files); `BUILD_PREFIX`/`REPAIR_PREFIX` are keyed by
+#: *component* (one `build:<component>`/`repair:<component>` pair per
+#: distinct project in the plan - see the module docstring on why). `impl:`
+#: node ids decode back through `task_id_of`; `build:`/`repair:` ids decode
+#: through `component_of` - never by matching substrings of a project name.
 IMPL_PREFIX: Final = "impl:"
 BUILD_PREFIX: Final = "build:"
 REPAIR_PREFIX: Final = "repair:"
+#: One barrier per component, joining every `impl:<task>` targeting it
+#: before its shared `build:<component>` becomes reachable - see
+#: `_nodes_for`.
+IMPL_READY_PREFIX: Final = "implready:"
 
 #: The only `TaskSpec.kind` this provider routes. A task of any other kind is
 #: rejected at admission rather than silently skipped: silently skipping work
@@ -103,21 +132,32 @@ def impl_node_id(task_id: str) -> str:
     return f"{IMPL_PREFIX}{task_id}"
 
 
-def build_node_id(task_id: str) -> str:
-    return f"{BUILD_PREFIX}{task_id}"
+def build_node_id(component: str) -> str:
+    return f"{BUILD_PREFIX}{component}"
 
 
-def repair_node_id(task_id: str) -> str:
-    return f"{REPAIR_PREFIX}{task_id}"
+def repair_node_id(component: str) -> str:
+    return f"{REPAIR_PREFIX}{component}"
+
+
+def impl_ready_node_id(component: str) -> str:
+    return f"{IMPL_READY_PREFIX}{component}"
 
 
 def task_id_of(node_id: str) -> str | None:
-    """The task a generated node belongs to, or `None` for a static node.
+    """The task an `impl:<task>` node belongs to, or `None` for anything
+    else (a static node, or a `build:`/`repair:` node - see `component_of`
+    for those)."""
+    if node_id.startswith(IMPL_PREFIX):
+        return node_id[len(IMPL_PREFIX) :]
+    return None
 
-    The inverse of the three id builders above, and the only supported way to
-    get from a node id back to a task - see the prefix constants' note.
-    """
-    for prefix in (IMPL_PREFIX, BUILD_PREFIX, REPAIR_PREFIX):
+
+def component_of(node_id: str) -> str | None:
+    """The component a `build:<component>`/`repair:<component>` node
+    compiles or repairs, or `None` for anything else. The inverse of
+    `build_node_id`/`repair_node_id` - see the prefix constants' note."""
+    for prefix in (BUILD_PREFIX, REPAIR_PREFIX):
         if node_id.startswith(prefix):
             return node_id[len(prefix) :]
     return None
@@ -137,9 +177,11 @@ def task_graph_of(state: RunState, source_node_id: str = "decompose") -> TaskGra
 
 
 def task_of(state: RunState, node_id: str, *, source_node_id: str = "decompose") -> TaskSpec | None:
-    """The `TaskSpec` a generated node implements, read back from the run's
-    own `TaskGraph` artifact. `None` for a static node, or before the
-    decomposer has produced anything."""
+    """The `TaskSpec` an `impl:<task>` node implements, read back from the
+    run's own `TaskGraph` artifact. `None` for a static node, a
+    `build:`/`repair:` node (see `tasks_of_component` for those - a
+    component's build/repair spans however many tasks target it, not one),
+    or before the decomposer has produced anything."""
     task_id = task_id_of(node_id)
     if task_id is None:
         return None
@@ -147,6 +189,24 @@ def task_of(state: RunState, node_id: str, *, source_node_id: str = "decompose")
     if graph is None:
         return None
     return next((t for t in graph.tasks if t.id == task_id), None)
+
+
+def tasks_of_component(
+    state: RunState, component: str, *, source_node_id: str = "decompose"
+) -> tuple[TaskSpec, ...]:
+    """Every `TaskSpec` targeting `component`, in the order the decomposer
+    listed them. `()` before the decomposer has produced anything, or if no
+    task targets it.
+
+    Needed by `agents/implementer.py`'s repair path: a `repair:<component>`
+    node fixes whatever every task that wrote to `component` produced, not
+    one task's worth - it must gather all of their descriptions, contracts
+    and dependencies, not just one.
+    """
+    graph = task_graph_of(state, source_node_id)
+    if graph is None:
+        return ()
+    return tuple(t for t in graph.tasks if t.component == component)
 
 
 def implementation_node_ids(state: RunState) -> tuple[str, ...]:
@@ -376,27 +436,47 @@ class TaskGraphSubgraphProvider:
                     description=f"{task.component}: {task.description}",
                 )
             )
+        # One build/repair pair per distinct component, not per task - see
+        # the module docstring. `dict.fromkeys` preserves first-seen order,
+        # which is deterministic (task list order) though not otherwise
+        # meaningful here.
+        components = tuple(dict.fromkeys(task.component for task in task_graph.tasks))
+        for component in components:
+            component_tasks = [t for t in task_graph.tasks if t.component == component]
             nodes.append(
                 NodeSpec(
-                    id=build_node_id(task.id),
-                    kind=NodeKind.TOOL,
-                    handler=self.build_handler,
-                    # `any`: ready on the first arrival from `impl:T`, and
-                    # again after `repair:T` succeeds. Bounded by the budget.
-                    join=JoinPolicy.ANY,
-                    cycle_budget=BUILD_CYCLE_BUDGET,
-                    timeout_seconds=_BUILD_TIMEOUT_SECONDS,
-                    description=f"dotnet build {task.component}",
+                    id=impl_ready_node_id(component),
+                    kind=NodeKind.BARRIER,
+                    join=JoinPolicy.ALL,
+                    description=f"every implementation task for {component} has succeeded",
                 )
             )
             nodes.append(
                 NodeSpec(
-                    id=repair_node_id(task.id),
+                    id=build_node_id(component),
+                    kind=NodeKind.TOOL,
+                    handler=self.build_handler,
+                    # `any`: ready on the first arrival from `implready:<component>`,
+                    # and again after `repair:<component>` succeeds. Only one
+                    # of the two is ever active at once - see the module
+                    # docstring's diagram. Bounded by the budget.
+                    join=JoinPolicy.ANY,
+                    cycle_budget=BUILD_CYCLE_BUDGET,
+                    timeout_seconds=_BUILD_TIMEOUT_SECONDS,
+                    description=f"dotnet build {component}",
+                )
+            )
+            nodes.append(
+                NodeSpec(
+                    id=repair_node_id(component),
                     kind=NodeKind.AGENT,
                     handler=self.implementer_handler,
                     produces="CodePatch",
                     timeout_seconds=_IMPL_TIMEOUT_SECONDS,
-                    description=f"repair {task.component} after a build failure",
+                    description=(
+                        f"repair {component} after a build failure, across "
+                        f"{len(component_tasks)} task(s)"
+                    ),
                 )
             )
         return tuple(nodes)
@@ -404,23 +484,45 @@ class TaskGraphSubgraphProvider:
     def _edges_for(self, task_graph: TaskGraph) -> tuple[Edge, ...]:
         edges: list[Edge] = []
         predecessor_in_component = _same_component_predecessors(task_graph)
+        by_id = {task.id: task for task in task_graph.tasks}
         for task in task_graph.tasks:
             impl = impl_node_id(task.id)
-            build = build_node_id(task.id)
-            repair = repair_node_id(task.id)
-            # Two sources of incoming edges, and the node joins `all` over
-            # both: the task's own declared dependencies, and the task that
-            # holds this component's write lock before it.
-            incoming = {build_node_id(d) for d in task.depends_on}
+            # Cross-component dependency edges wait on each dependency's
+            # *component build*, not its implementation - see the module
+            # docstring on why. A dependency in the task's *own* component is
+            # deliberately excluded from this: `build:<component>` only runs
+            # after *every* task in the component (including this one) has
+            # already succeeded (see `implready:<component>`'s `all` join
+            # below), so a same-component task that waited on its own
+            # component's build could never become ready in the first place -
+            # `impl:<task>` -> `implready:<component>` -> `build:<component>`
+            # -> `impl:<task>` is a cycle, and `with_subgraph` would reject
+            # the whole admission. The write lock instead chains directly
+            # `impl:<previous> -> impl:<task>` - still forward along
+            # `TaskGraph.ordered_ids()`'s topological order (see
+            # `_same_component_predecessors`'s own docstring), so the
+            # subgraph stays acyclic by the same construction as before, just
+            # one hop earlier. This covers same-component ordering whether or
+            # not the decomposer's `depends_on` happens to name it explicitly.
+            incoming = {
+                build_node_id(by_id[d].component)
+                for d in task.depends_on
+                if by_id[d].component != task.component
+            }
             if (previous := predecessor_in_component.get(task.id)) is not None:
-                incoming.add(build_node_id(previous))
+                incoming.add(impl_node_id(previous))
             if incoming:
-                # Wait on each source's *build*, not its implementation -
-                # see the module docstring.
                 edges.extend(Edge(source=source, target=impl) for source in sorted(incoming))
             else:
                 edges.append(Edge(source=self.start_node_id, target=impl))
-            edges.append(Edge(source=impl, target=build))
+            edges.append(Edge(source=impl, target=impl_ready_node_id(task.component)))
+
+        components = tuple(dict.fromkeys(task.component for task in task_graph.tasks))
+        for component in components:
+            ready = impl_ready_node_id(component)
+            build = build_node_id(component)
+            repair = repair_node_id(component)
+            edges.append(Edge(source=ready, target=build))
             edges.append(Edge(source=build, target=repair, condition=EdgeCondition.ON_FAILURE))
             # `on_success`, never `always`: a repair that produced no patch
             # must not re-trigger a build of unchanged source and spend that
