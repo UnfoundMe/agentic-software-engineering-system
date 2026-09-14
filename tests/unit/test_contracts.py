@@ -10,6 +10,7 @@ import yaml
 
 import ases
 from ases.contracts import CONTRACTS, Ambiguity, AmbiguityRegister, RequirementSpec
+from ases.contracts.artifacts import FrozenInterface, SolutionSkeleton, TaskSpec
 
 WORKFLOWS_DIR = Path(ases.__file__).parent / "workflows"
 
@@ -48,6 +49,66 @@ def test_ambiguity_register_tracks_resolution() -> None:
     assert not register.all_resolved
     assert register.ambiguities[0].is_resolved
     assert not register.ambiguities[1].is_resolved
+
+
+def _interface(type_name: str, *, project: str = "P", namespace: str = "N") -> FrozenInterface:
+    return FrozenInterface(
+        signature=f"public interface {type_name} {{ }}",
+        namespace=namespace,
+        project=project,
+        type_name=type_name,
+        file_path=f"{project}/{type_name}.cs",
+    )
+
+
+def test_task_spec_accepts_the_contract_linkage_fields() -> None:
+    task = TaskSpec(
+        id="t1",
+        description="implement the cache adapter",
+        component="Infra",
+        files=("Infra/RedisCache.cs",),
+        produces_contracts=("IShortLinkCache",),
+        consumes_contracts=("IShortLinkRepository",),
+    )
+    assert task.files == ("Infra/RedisCache.cs",)
+    assert task.produces_contracts == ("IShortLinkCache",)
+    assert task.consumes_contracts == ("IShortLinkRepository",)
+
+
+def test_solution_skeleton_rejects_a_duplicate_type_name() -> None:
+    with pytest.raises(Exception, match="duplicate frozen interface type_name"):
+        SolutionSkeleton(
+            frozen_interfaces=(
+                _interface("IFoo", project="A"),
+                _interface("IFoo", project="B"),
+            )
+        )
+
+
+def test_solution_skeleton_accepts_distinct_type_names() -> None:
+    skeleton = SolutionSkeleton(frozen_interfaces=(_interface("IFoo"), _interface("IBar")))
+    assert {i.type_name for i in skeleton.frozen_interfaces} == {"IFoo", "IBar"}
+
+
+def test_frozen_interface_block_renders_only_the_requested_type_names() -> None:
+    skeleton = SolutionSkeleton(frozen_interfaces=(_interface("IFoo"), _interface("IBar")))
+
+    block = skeleton.frozen_interface_block(type_names=("IFoo",))
+
+    assert "IFoo" in block
+    assert "IBar" not in block
+
+
+def test_frozen_interface_block_with_no_matching_type_names_says_none_stated() -> None:
+    skeleton = SolutionSkeleton(frozen_interfaces=(_interface("IFoo"),))
+    assert skeleton.frozen_interface_block(type_names=("INoSuchType",)) == "(none stated)"
+
+
+def test_frozen_interface_block_with_no_filter_renders_everything() -> None:
+    skeleton = SolutionSkeleton(frozen_interfaces=(_interface("IFoo"), _interface("IBar")))
+    block = skeleton.frozen_interface_block()
+    assert "IFoo" in block
+    assert "IBar" in block
 
 
 def _produces_kinds_in(path: Path) -> set[str]:

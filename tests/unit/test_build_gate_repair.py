@@ -77,8 +77,9 @@ class _FixedArtifactExecutor:
 def _graph() -> WorkflowGraph:
     return WorkflowGraph(
         name="build_gate_slice",
-        entry=("arch",),
+        entry=("req",),
         nodes=(
+            NodeSpec(id="req", kind=NodeKind.AGENT, handler="fake_req", produces="RequirementSpec"),
             NodeSpec(id="arch", kind=NodeKind.AGENT, handler="fake_arch", produces="DesignSpec"),
             NodeSpec(
                 id="scaffold",
@@ -105,6 +106,7 @@ def _graph() -> WorkflowGraph:
             NodeSpec(id="done", kind=NodeKind.TERMINAL),
         ),
         edges=(
+            Edge(source="req", target="arch"),
             Edge(source="arch", target="scaffold"),
             Edge(source="scaffold", target="decompose"),
             Edge(source="decompose", target="impl_domain"),
@@ -170,6 +172,9 @@ async def test_a_failed_per_task_build_triggers_repair_and_then_succeeds(
         # Payloads deliberately distinct, not `{}` - content addressing hashes
         # only the payload, not the kind (`_finish_agent_node`), so two empty
         # artifacts of different kinds would otherwise collide on one hash.
+        "fake_req": _FixedArtifactExecutor(
+            "RequirementSpec", {"summary": "r", "source_text": "build a thing"}
+        ),
         "fake_arch": _FixedArtifactExecutor("DesignSpec", {"summary": "d"}),
         "fake_scaffold": _FixedArtifactExecutor(
             "SolutionSkeleton", {"projects": ["UrlShortener.Domain"]}

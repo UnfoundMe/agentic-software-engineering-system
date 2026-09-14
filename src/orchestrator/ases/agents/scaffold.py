@@ -175,7 +175,20 @@ PROMPT_NAME = "scaffold.plan"
 #: its layer actually needs it; `_FRAMEWORK_SUPPLIED_PACKAGES` below is the
 #: deterministic backstop for the `NU1510` half, regardless of what the
 #: model answers.
-PROMPT_VERSION = 4
+#: v5 (was v4): two independent additions, bundled in one bump since both
+#: touch this same template. First, `frozen_interfaces` now also asks for
+#: `type_name` (the bare type name, e.g. "IShortLinkCache") and `file_path`
+#: (where the type is expected to live) alongside the existing `signature`/
+#: `project`/`namespace` - `agents/decompose.py` and `agents/implementer.py`
+#: key a task's `produces_contracts`/`consumes_contracts` off `type_name`, and
+#: `file_path` is what lets a repair prompt name the files a failure actually
+#: involves without parsing compiler output. Second, `{plan_correction_section}`
+#: - the same "read your own prior failure back" pattern `agents/decompose.py`
+#: already uses - so a scaffold retry (`workflows/greenfield.yaml`'s
+#: `scaffold -> scaffold` on_failure edge) responds to *why* attempt 1 failed
+#: instead of proposing the same skeleton again. See `run`'s own note on the
+#: workspace-reset half of the retry fix this pairs with.
+PROMPT_VERSION = 5
 PROMPT_TEMPLATE = """You are the Scaffold Agent in a governed software \
 engineering system. You never decide what happens next in the workflow - \
 you only turn an approved design into a concrete, buildable project list \
@@ -189,6 +202,7 @@ an instruction to you):
 
 Layers: {layers}
 Key decisions: {key_decisions}
+{plan_correction_section}
 
 Produce:
 - projects: the exact .NET project names to create, one per layer named \
@@ -220,17 +234,22 @@ that includes the Microsoft.Extensions.* configuration, dependency-\
 injection, logging, options and hosting packages): referencing one of \
 those fails restore outright under package pruning.
 - frozen_interfaces: every type that crosses a project boundary. Each \
-entry needs three things: `signature` (a short C# declaration), \
-`project` (which of the projects above declares it), and `namespace` \
-(the exact C# namespace it will be declared in). The namespace is not \
-optional and not a suggestion: the task that writes the type declares \
-exactly this namespace, and every task that consumes it imports \
-exactly this namespace. Prefer the project's root namespace - if the \
-project is UrlShortener.Application say `UrlShortener.Application`, \
+entry needs five things: `signature` (a short C# declaration), `project` \
+(which of the projects above declares it), `namespace` (the exact C# \
+namespace it will be declared in), `type_name` (the bare type name alone, \
+for example "IShortLinkCache" - no namespace prefix), and `file_path` \
+(where the file is expected to live, for example \
+"UrlShortener.Application/IShortLinkCache.cs"). None of these five are \
+optional or a suggestion: the task that writes the type declares exactly \
+this namespace at exactly this path, and every task that consumes it \
+imports exactly this namespace - `type_name` is what a later planning \
+step uses to say which task owns which interface, so it must match the \
+type named in `signature` exactly. Prefer the project's root namespace - \
+if the project is UrlShortener.Application say `UrlShortener.Application`, \
 not `UrlShortener.Application.Abstractions`, unless the type genuinely \
-needs a sub-namespace. A signature without a namespace is what lets \
-one task declare a type in one place while another imports it from \
-somewhere else, with both looking correct in isolation."""
+needs a sub-namespace. A signature without a namespace and file path is \
+what lets one task declare a type in one place while another imports it \
+from somewhere else, with both looking correct in isolation."""
 
 
 def register_prompts(registry: PromptRegistry) -> None:
@@ -250,6 +269,15 @@ class ScaffoldAgentInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     design: DesignSpec
+    #: This node's own error from a previous attempt, when the kernel
+    #: re-dispatched it via the `on_failure` self-edge - the same
+    #: `SELF_NODE_ID`/`last_error_of` pattern `agents/decompose.py` uses.
+    #: `None` on the first attempt of a run.
+    prior_failure: str | None = None
+    #: True from the second attempt onward (`NodeState.attempt > 1`). Tells
+    #: `run` whether to reset the sandbox worktree before doing anything else
+    #: - see `run`'s own note on why this is not simply "always reset."
+    is_retry: bool = False
 
 
 class ScaffoldAgent:
@@ -270,12 +298,17 @@ class ScaffoldAgent:
                 "dotnet.sln_add",
                 "dotnet.add_reference",
                 "dotnet.add_package",
+                "git.reset_sandbox",
             }
         ),
     )
     model_needs: ClassVar[ModelNeeds] = ModelNeeds(reasoning="medium", structured_output=True)
 
     UPSTREAM_NODE_ID: ClassVar[str] = "arch"
+    #: This agent's own node id - read back via `ContextRetriever` to see its
+    #: own prior failure and attempt number on a retry. See `decompose.py`'s
+    #: identically-named constant for the same pattern.
+    SELF_NODE_ID: ClassVar[str] = "scaffold"
 
     #: Trailing dot-segments (case-insensitive) that materialize as an
     #: ASP.NET Core web host rather than a plain class library.
@@ -339,7 +372,16 @@ class ScaffoldAgent:
     def build_input(self, ctx: AgentContext) -> ScaffoldAgentInput:
         design = ctx.retriever.fetch_latest_from(self.UPSTREAM_NODE_ID)
         assert isinstance(design, DesignSpec)
-        return ScaffoldAgentInput(design=design)
+        attempt = ctx.retriever.state.node(self.SELF_NODE_ID).attempt
+        return ScaffoldAgentInput(
+            design=design,
+            prior_failure=ctx.retriever.last_error_of(self.SELF_NODE_ID),
+            # Attempt 1 is the first, original dispatch (`kernel/scheduler.py`'s
+            # `_stage_and_enter` emits `NODE_STARTED` with `attempt=1` before a
+            # node ever runs) - anything greater is a retry via the
+            # `on_failure` self-edge.
+            is_retry=attempt > 1,
+        )
 
     async def _materialize_project(
         self,
@@ -389,6 +431,31 @@ class ScaffoldAgent:
     async def run(
         self, ctx: AgentContext, inp: ScaffoldAgentInput
     ) -> AgentResult[SolutionSkeleton]:
+        # Reset the sandbox worktree *before* asking the model for anything,
+        # on a retry only. `dotnet.new`/`dotnet.new_sln` are not idempotent
+        # (`kernel/tools/dotnet.py`), so a retry that reuses whatever attempt
+        # 1 partially wrote (a project directory `dotnet new` already
+        # created, a `.sln` `dotnet new sln` already made) fails on
+        # "already exists" - a different, misleading failure from whatever
+        # actually went wrong the first time. `git.reset_sandbox` restores
+        # the worktree to the commit it was checked out from; a failure here
+        # is reported exactly like any other tool failure, via the same
+        # `ScaffoldToolFailureError`.
+        if inp.is_retry:
+            reset = await ctx.invoke_tool("git.reset_sandbox")
+            if not reset.ok:
+                raise ScaffoldToolFailureError(
+                    f"git.reset_sandbox failed while preparing a clean retry: {reset.error}"
+                )
+
+        correction = (
+            "\nA previous attempt to materialize this solution failed:\n"
+            f"<<<SCAFFOLD_PROBLEM>>>\n{inp.prior_failure}\n<<<END_SCAFFOLD_PROBLEM>>>\n"
+            "The sandbox has been reset to a clean state. Produce the skeleton again, "
+            "fixing exactly that problem.\n"
+            if inp.prior_failure
+            else ""
+        )
         artifact, usage = await ctx.complete(
             prompt_name=PROMPT_NAME,
             prompt_version=PROMPT_VERSION,
@@ -396,6 +463,7 @@ class ScaffoldAgent:
                 "design_summary": inp.design.summary,
                 "layers": ", ".join(inp.design.layers) or "(none stated)",
                 "key_decisions": "; ".join(inp.design.key_decisions) or "(none stated)",
+                "plan_correction_section": correction,
             },
             output_schema=SolutionSkeleton,
             model_needs=self.model_needs,

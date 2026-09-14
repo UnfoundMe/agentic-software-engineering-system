@@ -25,8 +25,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ases.contracts.artifacts import SolutionSkeleton, TaskGraph
 from ases.kernel.tools.classification import SideEffect, ToolContext, ToolOutcome, ToolSpec
-from ases.validation.structure import check_reference_graph
+from ases.validation.structure import StructureReport, check_contract_graph, check_reference_graph
 
 
 def _csproj_text(root: Path, project: str) -> str | None:
@@ -46,6 +47,21 @@ def _csproj_text(root: Path, project: str) -> str | None:
         return None
 
 
+def _contract_report(args: Mapping[str, Any]) -> StructureReport:
+    """`check_contract_graph` over `tasks`/`frozen_interfaces`, when both are
+    given - purely additive: a caller with no task graph yet (or predating
+    this check) omits them and gets an empty report, same as before."""
+    raw_tasks = args.get("tasks")
+    raw_interfaces = args.get("frozen_interfaces")
+    if not raw_tasks or raw_interfaces is None:
+        return StructureReport()
+    task_graph = TaskGraph.model_validate({"tasks": raw_tasks})
+    skeleton = SolutionSkeleton.model_validate(
+        {"projects": args.get("projects", ()), "frozen_interfaces": raw_interfaces}
+    )
+    return check_contract_graph(task_graph=task_graph, skeleton=skeleton)
+
+
 async def _check_solution(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
     projects: Sequence[str] = [str(p) for p in args.get("projects", ())]
     if not projects:
@@ -60,7 +76,9 @@ async def _check_solution(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutc
 
     root = Path(str(ctx.cwd))
     texts = {p: text for p in projects if (text := _csproj_text(root, p)) is not None}
-    report = check_reference_graph(projects=projects, csproj_by_project=texts)
+    reference_report = check_reference_graph(projects=projects, csproj_by_project=texts)
+    contract_report = _contract_report(args)
+    report = StructureReport(findings=(*reference_report.findings, *contract_report.findings))
     return ToolOutcome(
         ok=report.ok,
         output={

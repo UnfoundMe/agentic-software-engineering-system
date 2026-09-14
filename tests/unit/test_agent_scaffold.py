@@ -10,6 +10,7 @@ here is the *wiring* (capability check, tool_cwd, argument passing), not the
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,7 @@ from ases.context.retriever import ContextRetriever, NoArtifactFromNodeError
 from ases.contracts.artifacts import DesignSpec, FrozenInterface, ProjectPackages, SolutionSkeleton
 from ases.kernel.state import ArtifactRecord, NodeState, RunState
 from ases.kernel.tools.dotnet import build_dotnet_tools
+from ases.kernel.tools.git import build_git_tools
 from ases.kernel.tools.registry import ToolRegistry
 from ases.providers.base import CompletionResult
 from ases.providers.mock import MockProvider
@@ -49,10 +51,17 @@ def _registry(runner: _FakeRunner) -> ToolRegistry:
     registry = ToolRegistry()
     for spec in build_dotnet_tools(runner):
         registry.register(spec)
+    # `run_argv`'s shared `SubprocessRunner` shape means the same fake runner
+    # records both dotnet and git calls, in true invocation order - exactly
+    # what a "reset came first" retry assertion needs.
+    for spec in build_git_tools(runner):
+        registry.register(spec)
     return registry
 
 
-def _state_with_design(design: DesignSpec) -> RunState:
+def _state_with_design(
+    design: DesignSpec, *, scaffold_attempt: int = 1, scaffold_last_error: str | None = None
+) -> RunState:
     state = RunState(run_id=uuid4())
     state.artifacts["h-design"] = ArtifactRecord(
         artifact_hash="h-design",
@@ -62,6 +71,14 @@ def _state_with_design(design: DesignSpec) -> RunState:
     )
     state.artifact_content["h-design"] = design.model_dump(mode="json")
     state.nodes["arch"] = NodeState(node_id="arch", produced=("h-design",))
+    # A real second-attempt dispatch (`kernel/scheduler.py`'s `on_failure`
+    # self-edge) has already folded `NODE_STARTED(attempt=2)` (and, when the
+    # first attempt failed, `NODE_FAILED`) into state by the time `build_input`
+    # runs - `scaffold_attempt`/`scaffold_last_error` recreate exactly that,
+    # without going through the scheduler for a unit-level test.
+    state.nodes["scaffold"] = NodeState(
+        node_id="scaffold", attempt=scaffold_attempt, last_error=scaffold_last_error
+    )
     return state
 
 
@@ -108,6 +125,8 @@ async def test_run_materializes_each_planned_project_via_dotnet_new() -> None:
                 signature="public interface IUrlRepository { }",
                 namespace="UrlShortener.Application",
                 project="UrlShortener.Application",
+                type_name="IUrlRepository",
+                file_path="UrlShortener.Application/IUrlRepository.cs",
             ),
         ),
     )
@@ -192,6 +211,97 @@ async def test_run_never_passes_version_to_add_package_even_if_the_model_supplie
         ["dotnet", "add", "UrlShortener.Domain", "package", "Microsoft.Extensions.Caching.Memory"],
     ]
     assert not any("--version" in call for call in runner.calls)
+
+
+async def test_build_input_reports_is_retry_and_prior_failure_from_a_second_attempt() -> None:
+    design = DesignSpec(summary="d")
+    agent = ScaffoldAgent()
+    ctx = _ctx(
+        MockProvider(),
+        _state_with_design(design, scaffold_attempt=2, scaffold_last_error="dotnet new failed"),
+        _registry(_FakeRunner()),
+    )
+
+    inp = agent.build_input(ctx)
+
+    assert inp.is_retry is True
+    assert inp.prior_failure == "dotnet new failed"
+
+
+async def test_build_input_reports_no_retry_on_the_first_attempt() -> None:
+    design = DesignSpec(summary="d")
+    agent = ScaffoldAgent()
+    ctx = _ctx(MockProvider(), _state_with_design(design), _registry(_FakeRunner()))
+
+    inp = agent.build_input(ctx)
+
+    assert inp.is_retry is False
+    assert inp.prior_failure is None
+
+
+async def test_run_resets_the_sandbox_before_anything_else_on_a_retry() -> None:
+    """Invariant: scaffold attempt N+1 must not inherit partial filesystem
+    mutations from failed scaffold attempt N. `git.reset_sandbox` must be the
+    very first tool call of a retry, before the model is even asked for a
+    skeleton to materialize."""
+    design = DesignSpec(summary="d")
+    skeleton = SolutionSkeleton(projects=("UrlShortener.Domain",))
+    provider = MockProvider()
+    provider.respond_with(
+        CompletionResult(
+            text=skeleton.model_dump_json(), parsed=skeleton, model_id="m", stop_reason="end_turn"
+        )
+    )
+    runner = _FakeRunner()
+    ctx = _ctx(
+        provider,
+        _state_with_design(design, scaffold_attempt=2, scaffold_last_error="boom"),
+        _registry(runner),
+    )
+    agent = ScaffoldAgent()
+
+    await agent.run(ctx, agent.build_input(ctx))
+
+    assert runner.calls[0] == ["git", "reset", "--hard", "HEAD"]
+    assert runner.calls[1] == ["git", "clean", "-xdf", "."]
+    assert runner.calls[2] == ["dotnet", "new", "sln", "-n", "UrlShortener"]
+
+
+async def test_run_makes_no_reset_call_on_the_first_attempt() -> None:
+    design = DesignSpec(summary="d")
+    skeleton = SolutionSkeleton(projects=("UrlShortener.Domain",))
+    provider = MockProvider()
+    provider.respond_with(
+        CompletionResult(
+            text=skeleton.model_dump_json(), parsed=skeleton, model_id="m", stop_reason="end_turn"
+        )
+    )
+    runner = _FakeRunner()
+    ctx = _ctx(provider, _state_with_design(design), _registry(runner))
+    agent = ScaffoldAgent()
+
+    await agent.run(ctx, agent.build_input(ctx))
+
+    assert not any(call[0:2] == ["git", "reset"] for call in runner.calls)
+    assert not any(call[0:2] == ["git", "clean"] for call in runner.calls)
+
+
+async def test_run_raises_if_the_sandbox_reset_fails() -> None:
+    design = DesignSpec(summary="d")
+    provider = MockProvider()
+    runner = _FailAtCallRunner(fail_at_index=0)
+    ctx = _ctx(
+        provider,
+        _state_with_design(design, scaffold_attempt=2, scaffold_last_error="boom"),
+        _registry(runner),
+    )
+    agent = ScaffoldAgent()
+
+    with pytest.raises(ScaffoldToolFailureError, match=re.escape("git.reset_sandbox")):
+        await agent.run(ctx, agent.build_input(ctx))
+    # The reset failed, so nothing else - not even the LLM call - should have
+    # been attempted.
+    assert runner.calls == [["git", "reset", "--hard", "HEAD"]]
 
 
 async def test_run_derives_a_generic_solution_name_when_projects_share_no_prefix() -> None:
@@ -326,6 +436,7 @@ def test_capability_manifest_grants_exactly_the_solution_linking_tools() -> None
             "dotnet.sln_add",
             "dotnet.add_reference",
             "dotnet.add_package",
+            "git.reset_sandbox",
         }
     )
 

@@ -1,11 +1,17 @@
 """Structural validation of a scaffolded solution, before anything is built.
 
-Two checks run before a single `dotnet build` is dispatched. The first lives
-in `agents.planner.TaskGraphSubgraphProvider._check_plan_fits_the_solution`
+Three checks run before a single `dotnet build` is dispatched. The first
+lives in `agents.planner.TaskGraphSubgraphProvider._check_plan_fits_the_solution`
 and is about the *plan*: every task names a real project, and every project
-the architecture called for has someone implementing it. This module is the
-second, and is about the *solution on disk*: the project reference graph the
-scaffold actually produced.
+the architecture called for has someone implementing it. This module holds
+the other two: `check_reference_graph` is about the *solution on disk* - the
+project reference graph the scaffold actually produced - and
+`check_contract_graph` is about the *plan's contract linkage* - whether
+`TaskSpec.produces_contracts`/`consumes_contracts` actually forms a
+consistent graph against `SolutionSkeleton.frozen_interfaces`, so a
+consuming task's context (`agents/implementer.py`) can be built from a
+contract the graph has already verified exists, is uniquely owned, and is
+reachable - rather than trusting an unverified decomposer claim.
 
 **Why this is worth doing separately from the compiler.** `dotnet build` will
 of course notice a missing type eventually - but by then the run has spent an
@@ -43,6 +49,8 @@ import re
 from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict
+
+from ases.contracts.artifacts import SolutionSkeleton, TaskGraph
 
 #: `<ProjectReference Include="..\Other\Other.csproj" />`, tolerant of
 #: attribute order, quoting style and whitespace. Deliberately a regex over
@@ -173,6 +181,124 @@ def check_reference_graph(
     return StructureReport(findings=tuple(findings))
 
 
+def check_contract_graph(*, task_graph: TaskGraph, skeleton: SolutionSkeleton) -> StructureReport:
+    """Check `TaskSpec.produces_contracts`/`consumes_contracts` against
+    `SolutionSkeleton.frozen_interfaces`, deterministically - no C# source is
+    read here, only the two structured artifacts the plan and the scaffold
+    already produced.
+
+    Five rules:
+
+    - `unknown_produced_contract` / `unknown_consumed_contract`: a task names
+      a `type_name` `skeleton.frozen_interfaces` does not declare.
+    - `contract_project_mismatch`: a task claims to produce an interface
+      declared (by `FrozenInterface.project`) in a different project than
+      the task's own `component` - the task cannot be the one writing it.
+    - `duplicate_contract_producer`: two tasks both claim to produce the same
+      `type_name` - ambiguous ownership, and exactly the shape that let two
+      tasks independently guess at (and diverge on) one interface before
+      `FrozenInterface` existed.
+    - `contract_without_producer`: a task consumes a `type_name` no task in
+      the graph produces - the direct check for "every consumed contract has
+      a producer."
+    - `contract_reference_missing`: a consuming task's project cannot reach
+      the producing interface's project. `skeleton.projects` is scaffolded as
+      a strictly linear reference chain (`agents/scaffold.py`), so "reachable"
+      is exactly `check_reference_graph`'s own `position` ordering: a project
+      may use an earlier project's types, never a later one's.
+    """
+    findings: list[StructuralFinding] = []
+    interfaces_by_name = {i.type_name: i for i in skeleton.frozen_interfaces}
+    position = {name: index for index, name in enumerate(skeleton.projects)}
+
+    producers: dict[str, list[str]] = {}
+    for task in task_graph.tasks:
+        for name in task.produces_contracts:
+            producers.setdefault(name, []).append(task.id)
+            interface = interfaces_by_name.get(name)
+            if interface is None:
+                findings.append(
+                    StructuralFinding(
+                        rule="unknown_produced_contract",
+                        project=task.component,
+                        message=(
+                            f"task {task.id!r} claims to produce {name!r}, which is not "
+                            "declared in the scaffold's frozen_interfaces"
+                        ),
+                    )
+                )
+            elif interface.project != task.component:
+                findings.append(
+                    StructuralFinding(
+                        rule="contract_project_mismatch",
+                        project=task.component,
+                        message=(
+                            f"task {task.id!r} (component {task.component!r}) claims to "
+                            f"produce {name!r}, which the scaffold declares in project "
+                            f"{interface.project!r} instead"
+                        ),
+                    )
+                )
+
+    for name, task_ids in producers.items():
+        if len(task_ids) > 1:
+            findings.append(
+                StructuralFinding(
+                    rule="duplicate_contract_producer",
+                    message=f"{name!r} is produced by more than one task: {sorted(task_ids)}",
+                )
+            )
+
+    for task in task_graph.tasks:
+        for name in task.consumes_contracts:
+            interface = interfaces_by_name.get(name)
+            if interface is None:
+                findings.append(
+                    StructuralFinding(
+                        rule="unknown_consumed_contract",
+                        project=task.component,
+                        message=(
+                            f"task {task.id!r} consumes {name!r}, which is not declared in "
+                            "the scaffold's frozen_interfaces"
+                        ),
+                    )
+                )
+                continue
+            if name not in producers:
+                findings.append(
+                    StructuralFinding(
+                        rule="contract_without_producer",
+                        project=task.component,
+                        message=(
+                            f"task {task.id!r} consumes {name!r}, which no task in the plan "
+                            "produces"
+                        ),
+                    )
+                )
+                continue
+            producer_position = position.get(interface.project)
+            consumer_position = position.get(task.component)
+            if (
+                producer_position is not None
+                and consumer_position is not None
+                and producer_position > consumer_position
+            ):
+                findings.append(
+                    StructuralFinding(
+                        rule="contract_reference_missing",
+                        project=task.component,
+                        message=(
+                            f"task {task.id!r} (component {task.component!r}) consumes "
+                            f"{name!r}, declared in project {interface.project!r}, which the "
+                            "architecture declares after it - a project may only reference "
+                            "one declared earlier, never one declared later"
+                        ),
+                    )
+                )
+
+    return StructureReport(findings=tuple(findings))
+
+
 def _first_cycle(edges: Mapping[str, Sequence[str]]) -> list[str] | None:
     """A reference cycle as a readable path, or None."""
     white, grey, black = 0, 1, 2
@@ -205,6 +331,7 @@ def _first_cycle(edges: Mapping[str, Sequence[str]]) -> list[str] | None:
 __all__ = [
     "StructuralFinding",
     "StructureReport",
+    "check_contract_graph",
     "check_reference_graph",
     "project_name_of",
     "references_in",
