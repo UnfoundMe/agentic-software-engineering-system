@@ -9,8 +9,7 @@ Install these before anything else:
 
 - **Docker** (Desktop or Engine, with `docker compose`)
 - **uv** (Python package/venv manager)
-- **.NET 10 SDK** — only needed to build/run the generated URL Shortener
-  workload, not the orchestrator itself
+- **.NET 10 SDK** — only needed to build/run the generated URL Shortener  workload, not the orchestrator itself
 
 ## First time on a new machine
 
@@ -36,9 +35,7 @@ What each step does:
    because `ASES_LLM_MODE=replay` (the default) needs no key.
 2. **`uv sync --all-extras`** — installs the Python venv from `uv.lock`. You
    cannot skip to `uv run ...` without this on a fresh clone.
-3. **`dev-up`** — starts Postgres + Redis containers, waits on the
-   healthcheck, then runs `ases db bootstrap` (idempotent roles/schemas/
-   grants) and `ases db upgrade` (Alembic migrations).
+3. **`dev-up`** — starts Postgres + Redis containers, waits on the healthcheck, then runs `ases db bootstrap` (idempotent roles/schemas/grants) and `ases db upgrade` (Alembic migrations).
 
 Running `dev-up` before copying `.env` fails fast on purpose:
 `No .env found. Run: Copy-Item .env.example .env`.

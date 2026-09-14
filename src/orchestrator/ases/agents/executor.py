@@ -12,13 +12,19 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
-from ases.agents.base import Agent, AgentContext, AgentExecutionError
+from ases.agents.base import (
+    Agent,
+    AgentContext,
+    AgentExecutionError,
+    CapabilityDeniedError,
+)
 from ases.context.retriever import ContextRetriever
+from ases.kernel.failures import FailureKind
 from ases.kernel.graph import NodeSpec
 from ases.kernel.scheduler import NodeExecutionOutcome
 from ases.kernel.state import RunState
 from ases.kernel.tools.registry import ToolRegistry
-from ases.providers.base import LLMProvider, ProviderError
+from ases.providers.base import LLMProvider, ProviderError, TruncatedCompletionError
 from ases.providers.prompts.registry import PromptRegistry
 from ases.providers.router import ModelRouter
 from ases.providers.structured import StructuredOutputExhaustedError
@@ -70,17 +76,38 @@ class AgentNodeExecutor:
         try:
             inp = self._agent.build_input(ctx)
             result = await self._agent.run(ctx, inp)
-        except (StructuredOutputExhaustedError, ProviderError, AgentExecutionError) as exc:
-            # An LLM-boundary failure (bounded repair exhausted, or the
-            # provider itself failed), or any `AgentExecutionError` an agent
-            # raised for its own normal failure modes (a self-escalation
-            # attempt its manifest refused, a tool call that failed) is a
-            # node failure, not a crash - the scheduler's own `ON_FAILURE` /
-            # repair-cycle machinery (Phase 1) decides what happens next,
-            # exactly as it does for a tool failure. Any other exception is a
+        except (StructuredOutputExhaustedError, TruncatedCompletionError) as exc:
+            # The model answered in a way the agent plane cannot turn into an
+            # artifact - it failed schema validation, or never finished
+            # emitting output at all. Classified apart from every other
+            # failure because it says nothing about the code being built: the
+            # tools were never reached. Live run `009ea59f-...` reported this
+            # as an "Invalid JSON" error and then halted blaming the *build*
+            # node's exhausted cycle_budget, which sent diagnosis in entirely
+            # the wrong direction. See `kernel.failures`.
+            return NodeExecutionOutcome(
+                ok=False, failure_kind=FailureKind.AGENT_PROTOCOL_FAILURE, error=str(exc)
+            )
+        except ProviderError as exc:
+            # The provider could not be reached or refused the request: the
+            # system failed, not the work.
+            return NodeExecutionOutcome(
+                ok=False, failure_kind=FailureKind.ORCHESTRATION_FAILURE, error=str(exc)
+            )
+        except CapabilityDeniedError as exc:
+            return NodeExecutionOutcome(
+                ok=False, failure_kind=FailureKind.POLICY_DENIED, error=str(exc)
+            )
+        except AgentExecutionError as exc:
+            # Any other failure mode an agent raises for itself - most often a
+            # tool call that failed. Not a crash: the scheduler's `ON_FAILURE`
+            # / repair-cycle machinery decides what happens next, exactly as
+            # it does for a tool node. Any exception *not* listed here is a
             # real bug (e.g. a `build_input` wiring mistake) and is left to
             # propagate rather than silently swallowed into "ok=False".
-            return NodeExecutionOutcome(ok=False, error=str(exc))
+            return NodeExecutionOutcome(
+                ok=False, failure_kind=FailureKind.TOOL_FAILURE, error=str(exc)
+            )
 
         return NodeExecutionOutcome(
             ok=True,

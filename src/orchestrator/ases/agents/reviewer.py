@@ -17,6 +17,7 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict
 
 from ases.agents.base import Agent, AgentContext, AgentResult, Citation
+from ases.agents.planner import implementation_node_ids, implementation_patches
 from ases.contracts.artifacts import CodePatch, DesignSpec, ReviewReport, TestSuite
 from ases.kernel.policy import CapabilityManifest
 from ases.providers.models import ModelNeeds
@@ -73,7 +74,6 @@ class ReviewerAgent:
     model_needs: ClassVar[ModelNeeds] = ModelNeeds(reasoning="high", structured_output=True)
 
     DESIGN_NODE_ID: ClassVar[str] = "arch"
-    IMPLEMENTATION_NODE_IDS: ClassVar[tuple[str, ...]] = ("impl_domain", "impl_api")
     TESTS_NODE_ID: ClassVar[str] = "test_gen"
 
     def build_input(self, ctx: AgentContext) -> ReviewerAgentInput:
@@ -81,14 +81,8 @@ class ReviewerAgent:
         tests = ctx.retriever.fetch_latest_from(self.TESTS_NODE_ID)
         assert isinstance(design, DesignSpec)
         assert isinstance(tests, TestSuite)
-        implementations: list[CodePatch] = []
-        for node_id in self.IMPLEMENTATION_NODE_IDS:
-            patch = ctx.retriever.fetch_latest_from(node_id)
-            assert isinstance(patch, CodePatch)
-            implementations.append(patch)
-        return ReviewerAgentInput(
-            design=design, implementations=tuple(implementations), tests=tests
-        )
+        implementations = implementation_patches(ctx.retriever.state)
+        return ReviewerAgentInput(design=design, implementations=implementations, tests=tests)
 
     async def run(self, ctx: AgentContext, inp: ReviewerAgentInput) -> AgentResult[ReviewReport]:
         artifact, usage = await ctx.complete(
@@ -115,7 +109,10 @@ class ReviewerAgent:
                 "3.7: deterministic validation remains authoritative."
             ),
             citations=(
-                *(Citation(source=f"artifact:{n}") for n in self.IMPLEMENTATION_NODE_IDS),
+                *(
+                    Citation(source=f"artifact:{n}")
+                    for n in implementation_node_ids(ctx.retriever.state)
+                ),
                 Citation(source=f"artifact:{self.TESTS_NODE_ID}"),
             ),
             usage=usage,

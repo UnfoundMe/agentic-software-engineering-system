@@ -108,6 +108,17 @@ class ContextRetriever:
     def __init__(self, state: RunState) -> None:
         self._state = state
 
+    @property
+    def state(self) -> RunState:
+        """The folded state this retriever reads.
+
+        Exposed for callers that need to ask a question about the *run*
+        rather than about one artifact - `agents.planner.task_of`
+        resolving which task a generated node belongs to, for instance.
+        Read-only by convention: `RunState` is a fold output and is
+        never mutated by anything but `kernel.state.apply`."""
+        return self._state
+
     def summary(self, artifact_hash: str) -> ArtifactSummary:
         record = self._state.artifacts.get(artifact_hash)
         if record is None:

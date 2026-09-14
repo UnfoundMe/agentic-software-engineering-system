@@ -24,7 +24,11 @@ from rich.console import Console
 from rich.table import Table
 
 import ases
-from ases.agents.wiring import build_greenfield_executors, register_all_prompts
+from ases.agents.wiring import (
+    build_greenfield_executors,
+    build_greenfield_subgraph_provider,
+    register_all_prompts,
+)
 from ases.config import REPO_ROOT, settings
 from ases.interfaces.terminal_approval import TerminalApprovalProvider
 from ases.kernel.events import Event
@@ -46,6 +50,7 @@ from ases.providers.prompts.registry import PromptRegistry
 from ases.providers.router import ModelRouter
 from ases.sandbox.promotion import PromotionError, promote
 from ases.sandbox.workspace import create_workspace
+from ases.validation.structure_tool import CHECK_SOLUTION
 
 app = typer.Typer(name="ases", help="Agentic Software Engineering System.", no_args_is_help=True)
 db_app = typer.Typer(help="Database provisioning and maintenance.", no_args_is_help=True)
@@ -112,6 +117,7 @@ def _build_tool_registry() -> ToolRegistry:
     registry.register(WRITE_FILE)
     registry.register(READ_FILE)
     registry.register(SCAN_FOR_SECRETS)
+    registry.register(CHECK_SOLUTION)
     registry.register(MIGRATIONS_CLASSIFY)
     for spec in build_dotnet_tools():
         registry.register(spec)
@@ -363,7 +369,15 @@ async def _run_greenfield(*, requirement: str, ref: str) -> None:
     )
     store = PostgresEventStore(cfg.app_dsn)
     scheduler = Scheduler(
-        graph, store, executors, entry_gate=entry_gate, approvals=TerminalApprovalProvider()
+        graph,
+        store,
+        executors,
+        entry_gate=entry_gate,
+        approvals=TerminalApprovalProvider(),
+        # The implementation nodes this run executes are not in the YAML:
+        # they are admitted here, from the decomposer's TaskGraph, once
+        # `decompose` succeeds. See `agents/planner.py`.
+        subgraphs=build_greenfield_subgraph_provider(),
     )
 
     heartbeat_task = asyncio.create_task(_heartbeat(in_flight))

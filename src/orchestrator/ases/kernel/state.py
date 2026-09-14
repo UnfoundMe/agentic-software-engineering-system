@@ -253,6 +253,19 @@ class RunState(BaseModel):
     #: content-less export simply has an empty dict here, never a KeyError.
     artifact_content: dict[str, Mapping[str, Any]] = Field(default_factory=dict)
     approvals: dict[str, ApprovalRecord] = Field(default_factory=dict)
+    #: Every subgraph admitted during this run, in admission order, each a
+    #: `{"nodes": [...], "edges": [...]}` record copied verbatim from its
+    #: `SUBGRAPH_ADMITTED` payload.
+    #:
+    #: Held here because the event log is the only source of truth for what a
+    #: run actually executed (CLAUDE.md section 4), and a dynamically admitted
+    #: implementation subgraph is part of that. Without it, resuming a run
+    #: that got past `decompose` would rebuild the *static* YAML graph and
+    #: then fold a state referring to dozens of nodes that graph has never
+    #: heard of - `Scheduler._readmit_recorded_subgraphs` replays these
+    #: instead, through the same `with_subgraph` validation the live
+    #: admission used.
+    admitted_subgraphs: list[Mapping[str, Any]] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
     policy_violations: int = 0
 
@@ -436,6 +449,14 @@ def apply(state: RunState, event: Event) -> RunState:
         case EventType.SUBGRAPH_ADMITTED:
             for nid in payload.get("node_ids", ()):
                 state.node(str(nid))
+            nodes = payload.get("nodes")
+            edges = payload.get("edges")
+            if nodes:
+                # Recorded whole, not just by id: `Scheduler` rebuilds the
+                # admitted graph from exactly this on resume. An older event
+                # that carried only `node_ids` folds as before and simply
+                # contributes no rebuildable record.
+                state.admitted_subgraphs.append({"nodes": nodes, "edges": edges or []})
 
         case EventType.APPROVAL_REQUESTED:
             if event.node_id is None:

@@ -89,10 +89,37 @@ class CompletionResult(BaseModel):
     text: str
     parsed: BaseModel | None = None
     schema_error: str | None = None
+    #: The response ran out of `max_tokens` before the model finished. A
+    #: distinct condition from `schema_error`, and one a repair attempt must
+    #: handle differently: re-sending the same prompt under the same ceiling
+    #: truncates again at the same place, which is exactly what live run
+    #: `009ea59f-...` did - twice, producing two byte-identical "Invalid
+    #: JSON" errors that were neither about JSON nor about the prompt. See
+    #: `providers.structured.complete_structured`.
+    truncated: bool = False
     model_id: str
     stop_reason: str
     usage: CompletionUsage = CompletionUsage()
     raw: Mapping[str, Any] = {}
+
+
+class TruncatedCompletionError(RuntimeError):
+    """The model ran out of `max_tokens` before producing usable output, and
+    raising the ceiling once did not change that.
+
+    Distinct from `structured.StructuredOutputExhaustedError` (the model
+    answered, but wrongly) and from `ProviderError` (no answer at all,
+    transport-level). Carries its own type so `agents.executor` can classify
+    it as `FailureKind.AGENT_PROTOCOL_FAILURE` with a message that names the
+    real cause instead of a misleading JSON-parse error."""
+
+    def __init__(self, schema_name: str, attempts: str) -> None:
+        super().__init__(
+            f"{schema_name}: the model's response was truncated at max_tokens before "
+            f"usable output was produced, and raising the ceiling did not help ({attempts}). "
+            "This is an agent protocol failure, not a source-code failure."
+        )
+        self.schema_name = schema_name
 
 
 class ProviderError(RuntimeError):

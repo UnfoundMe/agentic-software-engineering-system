@@ -5,9 +5,10 @@ CLI grows one) and by the full end-to-end test alike.
 
 Handler names here are the graph's, not the agent classes' own `name`
 attributes - `workflows/greenfield.yaml` names `dotnet_test`/`security_scan`/
-`dotnet_build_domain`/`dotnet_build_api`/`ef_database_update` for its
-`kind: tool` nodes, which is why `build_greenfield_executors` maps those
-explicitly rather than deriving every entry from `Agent.name`.
+`dotnet_build_domain`/`dotnet_build_api`/`dotnet_build_infrastructure`/
+`ef_database_update` for its `kind: tool` nodes, which is why
+`build_greenfield_executors` maps those explicitly rather than deriving
+every entry from `Agent.name`.
 """
 
 from __future__ import annotations
@@ -28,6 +29,11 @@ from ases.agents.implementer import ImplementerAgent
 from ases.agents.implementer import register_prompts as register_implementer_prompts
 from ases.agents.migration import MigrationAgent, ef_targets
 from ases.agents.migration import register_prompts as register_migration_prompts
+from ases.agents.planner import (
+    TaskGraphSubgraphProvider,
+    implementation_patches,
+    task_of,
+)
 from ases.agents.release import ReleaseAgent
 from ases.agents.release import register_prompts as register_release_prompts
 from ases.agents.requirements import RequirementsAgent
@@ -41,7 +47,9 @@ from ases.agents.tester import register_prompts as register_tester_prompts
 from ases.agents.tool_executor import ToolNodeExecutor
 from ases.context.lineage import UnknownArtifactError
 from ases.context.retriever import ContextRetriever, NoArtifactFromNodeError
-from ases.contracts.artifacts import CodePatch, SolutionSkeleton
+from ases.contracts.artifacts import SolutionSkeleton
+from ases.kernel.failures import FailureKind
+from ases.kernel.graph import NodeSpec
 from ases.kernel.scheduler import NodeExecutor
 from ases.kernel.tools.registry import ToolRegistry
 from ases.providers.base import LLMProvider
@@ -50,9 +58,10 @@ from ases.providers.router import ModelRouter
 
 #: Handler name -> `Agent` instance, exactly as `workflows/greenfield.yaml`
 #: names them (`req`/`arch`/... nodes declare `handler: requirements`,
-#: `handler: architect`, etc.) - `implementer` covers five graph positions
-#: (`impl_domain`, `impl_api`, `repair`, `repair_domain`, `repair_api`),
-#: differentiated by `ctx.node_id` as `agents/implementer.py` documents.
+#: `handler: architect`, etc.) - `implementer` covers seven graph positions
+#: (`impl_domain`, `impl_api`, `impl_infrastructure`, `repair`,
+#: `repair_domain`, `repair_api`, `repair_infrastructure`), differentiated by
+#: `ctx.node_id` as `agents/implementer.py` documents.
 _AGENTS: Mapping[str, Agent[Any, Any]] = {
     "requirements": RequirementsAgent(),
     "architect": ArchitectAgent(),
@@ -66,18 +75,15 @@ _AGENTS: Mapping[str, Agent[Any, Any]] = {
     "release": ReleaseAgent(),
 }
 
-#: The two `impl_*` nodes `sec_scan` should read - see `agents/decompose.py`'s
-#: docstring on why these are fixed graph positions rather than derived from
-#: `TaskGraph.tasks`.
-_IMPLEMENTATION_NODE_IDS: tuple[str, ...] = ("impl_domain", "impl_api")
-
-#: Mirrors `agents/migration.py`'s `_WEB_HOST_SUFFIXES` - duplicated rather
-#: than imported for the same reason that module gives (a three-word
-#: frozenset is not worth a shared module over, and the two call sites should
-#: not import each other). Picks the project `build_domain`/`repair_domain`
-#: target: `agents/implementer.py`'s own `_FOCUS_BY_NODE_ID` names the domain
-#: layer project by this same `.Domain` naming convention.
-_DOMAIN_SUFFIXES = frozenset({"domain"})
+#: Which nodes count as implementation output is a property of the run, not
+#: of this module. It used to be the tuple
+#: `("impl_domain", "impl_api", "impl_infrastructure")` - the three nodes the
+#: static graph happened to declare. `agents/docs.py`, `reviewer.py` and
+#: `tester.py` each kept their own copy of that idea and each listed only
+#: *two* of the three, so the reviewer, the test generator and the docs agent
+#: never saw a single line of infrastructure code in any run this system has
+#: performed. `implementation_patches` derives it instead, removing both the
+#: drift and the hard-coded architecture.
 
 
 def register_all_prompts(registry: PromptRegistry) -> None:
@@ -94,27 +100,14 @@ def register_all_prompts(registry: PromptRegistry) -> None:
     register_release_prompts(registry)
 
 
-def _scan_args(retriever: ContextRetriever) -> Mapping[str, object]:
-    """`security.scan_for_secrets` scans whatever the implementation tasks
-    actually wrote - concatenated, since the scanner takes one text blob."""
+def _scan_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
+    """`security.scan_for_secrets` scans every line of code this run wrote -
+    concatenated, since the scanner takes one text blob. A secrets scan that
+    covers only the layers someone remembered to list is not a secrets scan."""
     contents: list[str] = []
-    for node_id in _IMPLEMENTATION_NODE_IDS:
-        try:
-            patch = retriever.fetch_latest_from(node_id)
-        except (NoArtifactFromNodeError, UnknownArtifactError):
-            continue
-        if isinstance(patch, CodePatch):
-            contents.extend(f.content for f in patch.files if f.content is not None)
-    return {"content": "\n".join(contents)}
-
-
-def _domain_project(projects: tuple[str, ...]) -> str:
-    if not projects:
-        return ""
-    return next(
-        (p for p in projects if p.rsplit(".", 1)[-1].lower() in _DOMAIN_SUFFIXES),
-        projects[0],  # no name matched - fall back to the first declared project
-    )
+    for patch in implementation_patches(retriever.state):
+        contents.extend(f.content for f in patch.files if f.content is not None)
+    return {"content": chr(10).join(contents)}
 
 
 def _skeleton_from(retriever: ContextRetriever) -> SolutionSkeleton | None:
@@ -125,33 +118,28 @@ def _skeleton_from(retriever: ContextRetriever) -> SolutionSkeleton | None:
     return skeleton if isinstance(skeleton, SolutionSkeleton) else None
 
 
-def _build_domain_args(retriever: ContextRetriever) -> Mapping[str, object]:
-    """`build_domain`'s own project, so it builds only the domain layer
-    instead of falling back to a bare `dotnet build` - which resolves the
-    *whole* solution and is exactly what made this node and `build_api`
-    (`_build_api_args` below) do literally identical, redundant work. Found
-    live (`b5da55c3-...`): both nodes failed with byte-for-byte identical
-    diagnostics, then diverged unreproducibly on retry once dispatched
-    together by the scheduler's genuine `asyncio.gather` concurrency - see
-    `kernel/tools/process.py`'s per-cwd lock for the other half of that fix."""
-    skeleton = _skeleton_from(retriever)
-    if skeleton is None:
+def _dotnet_build_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
+    """The project one `build:<task>` node compiles.
+
+    One handler for every build node in the run, resolving its project from
+    the task the node belongs to (`planner.task_of`) rather than from a
+    closure fixed at wiring time. There used to be three of these -
+    `_build_domain_args`, `_build_api_args`, `_build_infrastructure_args` -
+    each finding its project by matching a suffix (`.domain`, `.api`,
+    `.infrastructure`) against `SolutionSkeleton.projects`. That is the
+    name-based inference this system is not supposed to route on, and it
+    could only ever name the three layers someone had written a builder for.
+
+    Falls back to an unscoped `dotnet build` (the whole solution) when the
+    node is not a generated task node or the task graph cannot be read - the
+    same conservative default the old builders used with no skeleton."""
+    task = task_of(retriever.state, node.id)
+    if task is None or not task.component:
         return {}
-    return {"project": _domain_project(skeleton.projects)}
+    return {"project": task.component}
 
 
-def _build_api_args(retriever: ContextRetriever) -> Mapping[str, object]:
-    """`build_api`'s own project - the same `_WEB_HOST_SUFFIXES` naming
-    convention `ef_targets` already applies, reused via its `startup_project`
-    return value rather than re-implemented here."""
-    skeleton = _skeleton_from(retriever)
-    if skeleton is None:
-        return {}
-    _, api_project = ef_targets(skeleton.projects)
-    return {"project": api_project}
-
-
-def _ef_database_update_args(retriever: ContextRetriever) -> Mapping[str, object]:
+def _ef_database_update_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
     """`migration_apply`'s `--project`/`--startup-project` - the same
     `SolutionSkeleton.projects` naming heuristic `agents/migration.py`'s
     `ef_targets` already applies for `ef.migrations_add`/`_script`, reused
@@ -164,6 +152,17 @@ def _ef_database_update_args(retriever: ContextRetriever) -> Mapping[str, object
     return {"project": project, "startup_project": startup_project}
 
 
+def _structure_check_args(retriever: ContextRetriever, node: NodeSpec) -> Mapping[str, object]:
+    """The scaffolded project list, in the dependency order the architecture
+    declared - which is the only architectural input the structural check
+    takes. See `validation/structure.py` on why it is expressed that way
+    rather than as named layers."""
+    skeleton = _skeleton_from(retriever)
+    if skeleton is None:
+        return {}
+    return {"projects": list(skeleton.projects)}
+
+
 def _scan_artifact(output: Mapping[str, object]) -> Mapping[str, object] | None:
     findings = output.get("findings")
     if not findings:
@@ -174,6 +173,26 @@ def _scan_artifact(output: Mapping[str, object]) -> Mapping[str, object] | None:
         "severity": "high",
         "message": f"{count} potential secret(s) found",
     }
+
+
+def build_greenfield_subgraph_provider() -> TaskGraphSubgraphProvider:
+    """The `SubgraphProvider` `kernel.scheduler.Scheduler` needs to admit the
+    decomposer's plan into `workflows/greenfield.yaml`'s generic execution
+    stage.
+
+    Separate from `build_greenfield_executors` because it is a different kind
+    of thing: the executors say how each node does its work, this says which
+    nodes exist. The node ids it is given here are the ones that workflow
+    declares (`decompose`, `scaffold`, `impl_start`, `impl_end`) - another
+    workflow with a differently-shaped lifecycle constructs its own."""
+    return TaskGraphSubgraphProvider(
+        source_node_id="decompose",
+        skeleton_node_id="scaffold",
+        start_node_id="impl_start",
+        end_node_id="impl_end",
+        implementer_handler="implementer",
+        build_handler="dotnet_build",
+    )
 
 
 def build_greenfield_executors(
@@ -201,16 +220,28 @@ def build_greenfield_executors(
         )
         for handler, agent in _AGENTS.items()
     }
-    executors["dotnet_test"] = ToolNodeExecutor("dotnet.test", tools=tools, tool_cwd=tool_cwd)
-    # Two distinct executors, not one shared `dotnet_build` - each node needs
-    # its own project scoped in via `build_args` (see `_build_domain_args`'s
-    # docstring for why a single shared, unscoped executor was the root cause
-    # of both nodes doing identical, redundant whole-solution builds).
-    executors["dotnet_build_domain"] = ToolNodeExecutor(
-        "dotnet.build", tools=tools, tool_cwd=tool_cwd, build_args=_build_domain_args
+    executors["dotnet_test"] = ToolNodeExecutor(
+        "dotnet.test", tools=tools, tool_cwd=tool_cwd, failure_kind=FailureKind.BUILD_FAILURE
     )
-    executors["dotnet_build_api"] = ToolNodeExecutor(
-        "dotnet.build", tools=tools, tool_cwd=tool_cwd, build_args=_build_api_args
+    # One `dotnet_build` handler for every build node in the run. The nodes
+    # are admitted at runtime from the decomposer's TaskGraph
+    # (`agents/planner.py`), so neither their count nor their projects are
+    # known here - `_dotnet_build_args` resolves each node's project from the
+    # task it belongs to. Replaces three handlers hard-coded to one
+    # Domain/Api/Infrastructure architecture.
+    executors["dotnet_build"] = ToolNodeExecutor(
+        "dotnet.build",
+        tools=tools,
+        tool_cwd=tool_cwd,
+        build_args=_dotnet_build_args,
+        failure_kind=FailureKind.BUILD_FAILURE,
+    )
+    executors["structure_check"] = ToolNodeExecutor(
+        "structure.check_solution",
+        tools=tools,
+        tool_cwd=tool_cwd,
+        build_args=_structure_check_args,
+        failure_kind=FailureKind.BUILD_FAILURE,
     )
     executors["ef_database_update"] = ToolNodeExecutor(
         "ef.database_update", tools=tools, tool_cwd=tool_cwd, build_args=_ef_database_update_args

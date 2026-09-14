@@ -6,23 +6,65 @@
 # live Scheduler today (tests/unit/test_greenfield_full_e2e.py), not just
 # WorkflowGraph.from_yaml() + validate_graph().
 #
-# Known simplification, stated plainly: DECOMPOSE's dynamic subgraph (the
-# IMPL_TASK_* fan-out) is not expressible in a static YAML file, since it is
-# admitted at runtime via `WorkflowGraph.with_subgraph`. This file therefore
-# hard-codes two implementation tasks (impl_domain, impl_api) as a stand-in
-# for what the decomposer would actually propose - real task count and shape
-# come from the decomposer's output once it exists.
+# This file describes the engineering *lifecycle* and nothing about the
+# architecture of the system being built. It used to do both: it hard-coded
+# `impl_domain`, `impl_api` and `impl_infrastructure`, each with its own
+# build gate and repair position, with a comment calling them stand-ins for
+# what the decomposer would eventually propose. Live run `009ea59f-...` is
+# what that cost - the decomposer proposed twenty tasks across four layers,
+# five of them for `UrlShortener.Application`, and since no node existed for
+# that layer those five were silently never executed. The project kept its
+# scaffolded `Class1.cs`, and every type Infrastructure and the API compiled
+# against failed to resolve. The plan was right; nothing ran it.
 #
-# Per-task `dotnet build` exit gate (docs/02 Phase 4): `build_domain` and
-# `build_api` each gate their own implementation task, with their own bounded
-# repair position (`repair_domain`/`repair_api`) - compile failures surface
-# per task, not as a pile-up at the barrier's `test_run`.
+# Implementation work now enters between `impl_start` and `impl_end`, both
+# plain barriers. When `decompose` succeeds, `agents/planner.py` turns each
+# `TaskSpec` into an `impl:<id>` node, a `build:<id>` gate and a
+# `repair:<id>` position, wires them by the task's declared `depends_on`,
+# and the scheduler admits the lot through `WorkflowGraph.with_subgraph` -
+# validated as a whole candidate graph before any of it can execute.
+# Independent tasks are dispatched together; dependent ones wait on their
+# dependency's *build*, so a task never starts against code that exists but
+# does not compile.
+#
+# `impl_start -> impl_end` is a real edge, kept on purpose: `validate_graph`
+# runs at load, before any task exists, and an empty `TaskGraph` must degrade
+# to "no implementation work" rather than to a graph with an unreachable
+# barrier.
+#
+# `structure_check` is the other half of the pre-build validation. The plan's
+# coverage - does every scaffolded project have someone implementing it? - is
+# checked at admission in `agents/planner.py`; the reference graph the
+# scaffold actually produced is checked here, against the dependency order
+# the architecture declared. Both run before a single implementation call.
 #
 # Migration pipeline (docs/04 section 4): `migration` generates and
-# classifies an EF Core migration from the domain implementation but never
-# applies it; `migration_gate` is a human approval node - the same mechanism
+# classifies an EF Core migration from the implementation but never applies
+# it; `migration_gate` is a human approval node - the same mechanism
 # gate1/gate2/gate3 already use - placed before the one node
-# (`migration_apply`) that actually runs `ef.database_update`.
+# (`migration_apply`) that actually runs `ef.database_update`. It joins `any`
+# over one real prerequisite (`impl_end`) plus the usual `on_rejected` redo
+# edge. `impl_end` is the correct prerequisite and a stronger one than the
+# two named build nodes it replaced: it joins `all`, so it is reached only
+# once *every* admitted build has succeeded - entities and DbContext
+# included, whatever projects this architecture put them in.
+#
+# Repair -> build/test edges are `on_success`, not `always`. `always` fires
+# on a FAILED source too (see `EdgeCondition.matches`), so a repair agent
+# that could not produce a `CodePatch` at all - an agent *protocol* failure,
+# `kernel/failures.py` - still re-triggered the build it was repairing,
+# burning one of that node's `cycle_budget` attempts on a rebuild of
+# byte-identical source. Live run `009ea59f-...` ended exactly that way:
+# `repair_api` failed twice on truncated model output, `build_api` was
+# re-dispatched twice regardless, exhausted its budget, and the run halted
+# reporting *the build's* cycle budget - naming the wrong component. Under
+# `on_success` a repair that produced nothing has no outgoing edge that
+# matches, so the run stops at the repair node and reports the protocol
+# failure that actually happened. The build-fails-to-barrier semantics are
+# unchanged and were already correct: every `build_* -> barrier` edge is
+# `on_success` by default (`Edge.condition`), and `barrier` joins `all`, so
+# a failed build has never been able to satisfy it - pinned now by
+# `tests/unit/test_build_gate_repair.py::test_a_failed_build_never_satisfies_the_barrier`.
 #
 # Rejection cycles on every gate, not just gate1 (found via a live run:
 # rejecting gate2 silently stopped the workflow with no way to try again,
@@ -39,6 +81,64 @@
 # the underlying code a rejection might actually be about. Routing a
 # rejection further upstream (e.g. back to `impl_domain`) is a re-planning
 # concern (docs/02 Phase 7), not attempted here.
+#
+# Failure cycles on every post-approval producer, for the same reason.
+# `decompose` got an `on_failure` self-edge first, because its output is what
+# the implementation subgraph is built from; every node downstream of gate2
+# had the identical hole. `scaffold`, `migration`, `test_gen`, `review`,
+# `docs_gen` and `release` all run *after* gate1 and gate2 have been granted,
+# so one truncated or schema-invalid model response at any of them discarded
+# two human approvals and everything built on them. Each now loops back to
+# itself on failure, one hop, bounded.
+#
+# `arch` is in the set for the same reason, and was found the same way: it
+# runs on gate1's grant, so failing there discards that approval. It is the
+# earliest node the rule reaches - `req` is upstream of every gate and so
+# genuinely costs nothing but itself.
+#
+# `scaffold` was the last one added, and only after it cost a live run.
+# `bd184488-...` reached it with both gates granted, the node failed once,
+# and the run ended there - the exact shape this pattern exists to prevent,
+# missed because `scaffold` had been filed with the pre-approval nodes when
+# its only predecessor is `gate2`. Position in the file is not the test;
+# "is anything already approved when this runs?" is.
+#
+# Two mechanical details this depends on, both easy to get wrong:
+#
+# - `join: any` is *required*, not a preference. A self-edge is an incoming
+#   edge, so under the default `join: all` the node's own `on_failure` edge
+#   would have to match its own status before it could ever start - and on
+#   first arrival that status is PENDING, which `on_failure` does not match.
+#   The node would never run at all. `any` is safe here because each of the
+#   five has exactly one *real* prerequisite (`impl_end`, `barrier`,
+#   `test_run`, `test_run`, `quality_gate` respectively), so `any` and `all`
+#   agree on the first entry; it is not a weakening of a genuine multi-way
+#   join. The two fan-in barriers that do join several real predecessors -
+#   `barrier` and `quality_gate` - are untouched and still `all`.
+# - `migration` and `release` keep `cycle_budget: 3`. The ceiling is
+#   deliberately *not* raised to make room for the new path: a budget is a
+#   bound on how many times a node may be entered for any reason, and adding
+#   a second legitimate reason to re-enter does not justify more entries.
+#   The trade-off is real and worth stating - a failure retry and a
+#   `migration_gate`/`gate3` rejection retry now draw on the same three.
+#
+# Disclosed limit, and the difference from `decompose`: these five retries
+# are *blind*. `decompose` reads its own prior failure via
+# `ContextRetriever.last_error_of` and feeds it into its prompt, so attempt 2
+# answers the actual complaint; these five re-run their prompt unchanged and
+# rely on the response differing. That is worth having for the failure that
+# actually occurred in the live runs - a response truncated at `max_tokens`,
+# which `providers/structured.py` already re-attempts with headroom - and is
+# close to worthless for a deterministic contract violation. Wiring the same
+# prior-failure feedback into these agents' prompts is the next step, not
+# something this change claims to have done. Exhausting a budget still
+# safe-stops (`RUN_HALTED`) with the node named, and every attempt remains a
+# `NODE_FAILED` event: nothing here hides a failure, it only stops one
+# correctable slip from throwing away approved work.
+#
+# `sec_scan` is deliberately left without one. It is a tool node, not an
+# agent - a deterministic scan that failed will fail again the same way, and
+# a retry would only spend time to reach the same halt.
 
 name: greenfield
 description: >
@@ -66,8 +166,8 @@ nodes:
     kind: agent
     handler: architect
     produces: DesignSpec
-    join: any # ready on first arrival (gate1) OR after gate2 rejects
-    cycle_budget: 3 # bounds the redo cycle if gate2 rejects
+    join: any # first arrival (gate1), gate2 rejecting, OR its own failure
+    cycle_budget: 3 # bounds both re-entry reasons - rejection and failure - together
     timeout_seconds: 180
 
   - id: gate2
@@ -79,59 +179,71 @@ nodes:
     kind: agent
     handler: scaffold
     produces: SolutionSkeleton
-    timeout_seconds: 120
+    join: any # ready on first arrival (gate2) OR after its own failure
+    cycle_budget: 2 # one retry; exhausting it safe-stops
+    timeout_seconds: 420 # advisory only - see NodeSpec.timeout_seconds
 
   - id: decompose
     kind: agent
     handler: decompose
     produces: TaskGraph
+    # `decompose` is the one agent whose output the kernel must accept before
+    # anything downstream exists at all: its TaskGraph becomes the live
+    # implementation subgraph. A plan that cannot be admitted - a component
+    # naming a project the scaffold never created, a scaffolded project left
+    # with no task, a truncated response that produced no plan - used to fail
+    # the node with no ON_FAILURE edge anywhere, which ends the whole run.
+    # That happens *after* gate1 and gate2 have already been granted, so one
+    # correctable model slip discarded two human approvals and everything
+    # built on them.
+    #
+    # The `on_failure` self-edge below is the same bounded "producer tries
+    # again" shape every gate rejection already uses, with the producer and
+    # the trigger being the same node. `join: any` because `scaffold` stays
+    # permanently SUCCEEDED and must not be required to re-fire; the retry is
+    # bounded by `cycle_budget`, and exhausting it safe-stops (RUN_HALTED)
+    # rather than failing outright. The agent reads its own prior failure via
+    # `ContextRetriever.last_error_of` and feeds it back into its prompt, so
+    # the second attempt answers the actual complaint instead of regenerating
+    # the same plan - see agents/decompose.py's SELF_NODE_ID.
+    join: any # ready on first arrival (scaffold) OR after its own failure
+    cycle_budget: 2
     timeout_seconds: 60
 
   # Stand-ins for the decomposer's dynamic subgraph - see the module note above.
-  - id: impl_domain
-    kind: agent
-    handler: implementer
-    produces: CodePatch
-    timeout_seconds: 300
-
-  - id: impl_api
-    kind: agent
-    handler: implementer
-    produces: CodePatch
-    timeout_seconds: 300
-
-  - id: build_domain
+  # The generic execution stage. Everything between these two barriers is
+  # admitted at runtime from the decomposer's TaskGraph
+  # (agents/planner.py) - this file states that implementation happens here,
+  # never what the implementation *is*. `impl_start -> impl_end` is a real
+  # edge, not a placeholder: it keeps this file a valid graph on its own
+  # (validate_graph runs at load, before any task exists) and makes an empty
+  # TaskGraph degrade to "no implementation work" instead of a dangling
+  # graph.
+  # Deterministic, read-only, and cheap: the project reference graph the
+  # scaffold produced, checked against the dependency order the architecture
+  # declared, before a single implementation call or `dotnet build` is spent.
+  # The plan's own coverage check (does every scaffolded project have someone
+  # implementing it?) already ran at subgraph admission - see
+  # agents/planner.py. Together these are the pre-build structural stage.
+  - id: structure_check
     kind: tool
-    handler: dotnet_build_domain
-    join: any # ready on first arrival OR after repair_domain completes
-    cycle_budget: 2
-    timeout_seconds: 300
+    handler: structure_check
+    timeout_seconds: 60
 
-  - id: build_api
-    kind: tool
-    handler: dotnet_build_api
-    join: any # ready on first arrival OR after repair_api completes
-    cycle_budget: 2
-    timeout_seconds: 300
+  - id: impl_start
+    kind: barrier
+    join: all
 
-  - id: repair_domain
-    kind: agent
-    handler: implementer
-    produces: CodePatch
-    timeout_seconds: 300
-
-  - id: repair_api
-    kind: agent
-    handler: implementer
-    produces: CodePatch
-    timeout_seconds: 300
+  - id: impl_end
+    kind: barrier
+    join: all # impl_start AND every admitted build:<task> must have succeeded
 
   - id: migration
     kind: agent
     handler: migration
     produces: MigrationPlan
-    join: any # ready on first arrival (build_domain) OR after migration_gate rejects
-    cycle_budget: 3 # bounds the redo cycle if migration_gate rejects
+    join: any # first arrival (impl_end), migration_gate rejecting, OR its own failure
+    cycle_budget: 3 # bounds both re-entry reasons - rejection and failure - together
     timeout_seconds: 180
 
   - id: migration_gate
@@ -154,6 +266,8 @@ nodes:
     kind: agent
     handler: tester
     produces: TestSuite
+    join: any # ready on first arrival (barrier) OR after its own failure
+    cycle_budget: 2 # one retry; exhausting it safe-stops
     timeout_seconds: 180
 
   - id: test_run
@@ -173,6 +287,8 @@ nodes:
     kind: agent
     handler: reviewer
     produces: ReviewReport
+    join: any # ready on first arrival (test_run) OR after its own failure
+    cycle_budget: 2 # one retry; exhausting it safe-stops
     timeout_seconds: 180
 
   - id: sec_scan
@@ -185,6 +301,8 @@ nodes:
     kind: agent
     handler: docs
     produces: DocsPatch
+    join: any # ready on first arrival (test_run) OR after its own failure
+    cycle_budget: 2 # one retry; exhausting it safe-stops
     timeout_seconds: 120
 
   - id: quality_gate
@@ -195,8 +313,8 @@ nodes:
     kind: agent
     handler: release
     produces: ReleaseReport
-    join: any # ready on first arrival (quality_gate) OR after gate3 rejects
-    cycle_budget: 3 # bounds the redo cycle if gate3 rejects
+    join: any # first arrival (quality_gate), gate3 rejecting, OR its own failure
+    cycle_budget: 3 # bounds both re-entry reasons - rejection and failure - together
     timeout_seconds: 120
 
   - id: gate3
@@ -212,35 +330,38 @@ edges:
   - { source: gate1, target: arch }
   - { source: gate1, target: req, condition: on_rejected }
   - { source: arch, target: gate2 }
+  - { source: arch, target: arch, condition: on_failure }
   - { source: gate2, target: arch, condition: on_rejected }
   - { source: gate2, target: scaffold }
+  - { source: scaffold, target: scaffold, condition: on_failure }
   - { source: scaffold, target: decompose }
-  - { source: decompose, target: impl_domain }
-  - { source: decompose, target: impl_api }
-  - { source: impl_domain, target: build_domain }
-  - { source: build_domain, target: repair_domain, condition: on_failure }
-  - { source: repair_domain, target: build_domain, condition: always }
-  - { source: build_domain, target: barrier }
-  - { source: impl_api, target: build_api }
-  - { source: build_api, target: repair_api, condition: on_failure }
-  - { source: repair_api, target: build_api, condition: always }
-  - { source: build_api, target: barrier }
-  - { source: build_domain, target: migration }
+  - { source: decompose, target: decompose, condition: on_failure }
+  - { source: decompose, target: structure_check }
+  - { source: structure_check, target: impl_start }
+  # Kept deliberately - see the impl_start/impl_end node comment above.
+  - { source: impl_start, target: impl_end }
+  - { source: impl_end, target: migration }
+  - { source: migration, target: migration, condition: on_failure }
+  - { source: impl_end, target: barrier }
   - { source: migration, target: migration_gate }
   - { source: migration_gate, target: migration, condition: on_rejected }
   - { source: migration_gate, target: migration_apply }
   - { source: migration_apply, target: barrier }
   - { source: barrier, target: test_gen }
+  - { source: test_gen, target: test_gen, condition: on_failure }
   - { source: test_gen, target: test_run }
   - { source: test_run, target: repair, condition: on_failure }
-  - { source: repair, target: test_run, condition: always }
+  - { source: repair, target: test_run, condition: on_success }
   - { source: test_run, target: review }
+  - { source: review, target: review, condition: on_failure }
   - { source: test_run, target: sec_scan }
   - { source: test_run, target: docs_gen }
+  - { source: docs_gen, target: docs_gen, condition: on_failure }
   - { source: review, target: quality_gate }
   - { source: sec_scan, target: quality_gate }
   - { source: docs_gen, target: quality_gate }
   - { source: quality_gate, target: release }
+  - { source: release, target: release, condition: on_failure }
   - { source: release, target: gate3 }
   - { source: gate3, target: release, condition: on_rejected }
   - { source: gate3, target: summary }

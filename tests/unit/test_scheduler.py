@@ -8,8 +8,9 @@ and separate so a failure points at one mechanism, not a tangle of them.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -18,7 +19,7 @@ from ases.kernel.events import EventType
 from ases.kernel.gates import ApprovalDecision, ApprovalProvider, BudgetEntryGate, BudgetLimits
 from ases.kernel.graph import Edge, EdgeCondition, JoinPolicy, NodeKind, NodeSpec, WorkflowGraph
 from ases.kernel.scheduler import ConfigurationError, NodeExecutionOutcome, NodeExecutor, Scheduler
-from ases.kernel.state import NodeStatus, RunStatus, fold
+from ases.kernel.state import NodeStatus, RunState, RunStatus, fold
 from ases.kernel.store.jsonl import JsonlEventStore
 from tests.unit.fakes import (
     FixedExecutor,
@@ -632,3 +633,62 @@ async def test_a_second_scheduler_can_finish_what_the_first_started(
     assert final_state.status is RunStatus.COMPLETED
     independent_fold = fold(run_id, await store.read_all(run_id))
     assert independent_fold.model_dump() == final_state.model_dump()
+
+
+# --- declared timeouts are advisory, deliberately -----------------------------
+
+
+class _SlowerThanDeclared:
+    """Takes longer than its node declares. Stands in for the real case: a
+    `scaffold` call that legitimately needs 201s against a declared 120s,
+    mostly spent in adaptive extended thinking that emits no tokens."""
+
+    def __init__(self) -> None:
+        self.finished = False
+
+    async def execute(self, node: NodeSpec, state: RunState) -> NodeExecutionOutcome:
+        await asyncio.sleep(0.05)
+        self.finished = True
+        return ok()
+
+
+def _slow_graph() -> WorkflowGraph:
+    return WorkflowGraph(
+        name="slow",
+        entry=("slow",),
+        nodes=(
+            # Declared far below what the executor above actually takes.
+            NodeSpec(id="slow", kind=NodeKind.AGENT, handler="slow", timeout_seconds=0.001),
+            NodeSpec(id="done", kind=NodeKind.TERMINAL),
+        ),
+        edges=(Edge(source="slow", target="done"),),
+    )
+
+
+async def test_a_node_slower_than_its_declared_timeout_is_left_alone(tmp_path: Path) -> None:
+    """The scheduler does not cancel on `timeout_seconds`, and this pins that
+    as a decision rather than an omission.
+
+    Enforcement was added here briefly and removed after one live run: it
+    cancelled `scaffold` at its declared 120s on a call that had succeeded in
+    201s the run before, failing the whole run after two human approvals.
+    Execution is already bounded at the two layers that can attribute a stall
+    to something - `kernel.tools.registry` wraps every tool invocation in
+    `asyncio.wait_for(..., spec.timeout_s)`, and the provider SDK bounds each
+    HTTP call - and a third ceiling above those could only cut short work
+    those layers considered healthy.
+
+    If per-node deadlines are wanted back, they need calibrating against
+    `max_tokens` and against `providers/structured.py`'s retry, and every
+    agent node needs a recovery edge first. Re-adding `asyncio.wait_for`
+    around the executor call will fail this test, which is the point."""
+    executor = _SlowerThanDeclared()
+    store = JsonlEventStore(tmp_path / "events", fsync=False)
+
+    state = await Scheduler(
+        _slow_graph(), store, {"slow": executor}, entry_gate=BudgetEntryGate(GENEROUS)
+    ).run(uuid4())
+
+    assert executor.finished is True, "the executor was cancelled mid-flight"
+    assert state.nodes["slow"].status is NodeStatus.SUCCEEDED
+    assert state.status is RunStatus.COMPLETED

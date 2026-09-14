@@ -7,19 +7,19 @@ and returns a plain outcome - it has no way to influence what happens after.
 
 **What this module does implement:** readiness (join policies over edge
 conditions), parallel dispatch of independent agent/tool nodes, entry-gate
-budget enforcement, human approval (via a pluggable `ApprovalProvider`),
-bounded repair cycles, a *direct* one-hop mechanism (`_propagate_edge_completion`)
-that re-stages an already-settled successor when a matching edge fires - this
-is what both the repair loop and a rejected gate sending its producer back run
-on - and safe-stop on budget or cycle exhaustion.
+budget enforcement, human approval (via a
+pluggable `ApprovalProvider`), bounded repair cycles, a *direct* one-hop
+mechanism (`_propagate_edge_completion`) that re-stages an already-settled
+successor when a matching edge fires - this is what both the repair loop and
+a rejected gate sending its producer back run on - dynamic subgraph admission
+(`_admit_subgraph_for`, via an injected `SubgraphProvider`; this is what lets
+a decomposer's plan become executable nodes mid-run, re-applied from the
+event log on resume by `_readmit_recorded_subgraphs`), and safe-stop on
+budget or cycle exhaustion.
 
 **What it deliberately does not implement yet**, so nothing here is mistaken
 for more than it is:
 
-- **Dynamic subgraph admission.** `WorkflowGraph.with_subgraph` exists and is
-  tested at the graph level, but no `NodeExecutor` outcome here can yet cause
-  the running scheduler to admit new nodes mid-run. Wiring a `DECOMPOSE` node
-  to do that is Phase 4 work.
 - **Full re-planning.** `_propagate_edge_completion` restarts exactly the one
   node named by the matching edge. It does not walk the lineage DAG to find
   and invalidate further descendants, and it does not revoke approvals that
@@ -31,6 +31,23 @@ for more than it is:
   compensation, fallback content). Failures here either follow a graph-level
   `ON_FAILURE` edge (if the workflow author provided one) or fail the run.
   Phase 5 (`kernel.recovery`) adds per-tool classification on top of this.
+- **Per-node wall-clock timeouts.** `NodeSpec.timeout_seconds` is declared
+  on every node of every workflow YAML and is deliberately *not* enforced
+  here. Execution is already bounded twice, at the two layers that can
+  actually attribute a stall: `kernel.tools.registry` wraps every tool
+  invocation in `asyncio.wait_for(..., spec.timeout_s)`, and the Anthropic
+  SDK applies a 600s read timeout to each HTTP call. A third ceiling above
+  those bounded nothing new - it could only cut short work the lower layers
+  considered healthy, which is exactly what it did: it was added briefly,
+  and the first live run under it cancelled `scaffold` at 120s on a call
+  that had taken 201s (successfully) the run before, failing the whole run
+  after two human approvals had already been granted. The declared value is
+  kept as the workflow author's documented expectation and as the input
+  `agents/planner.py` gives its admitted nodes; what it is not is a
+  guarantee the kernel makes. The residual gap, stated rather than papered
+  over: an agent node's worst case is `providers/structured.py`'s two calls
+  at the SDK ceiling, and `BudgetEntryGate` evaluates wall-clock at node
+  *entry*, so neither stops a single pathologically slow node mid-flight.
 - **Policy enforcement.** The only gate implemented is the budget check;
   `kernel.policy` (Phase 3) is a separate concern layered on top later.
 """
@@ -47,8 +64,16 @@ from pydantic import BaseModel, ConfigDict
 from ases.kernel.cancellation import CancellationRequestedError, CancelToken
 from ases.kernel.checkpoint import Checkpoint, CheckpointStore, resume
 from ases.kernel.events import Actor, Event, EventType, UnsealedEvent
+from ases.kernel.failures import FailureKind
 from ases.kernel.gates import ApprovalDecision, ApprovalProvider, BudgetEntryGate, GateVerdict
-from ases.kernel.graph import Edge, EdgeCondition, JoinPolicy, NodeKind, NodeSpec, WorkflowGraph
+from ases.kernel.graph import (
+    Edge,
+    EdgeCondition,
+    JoinPolicy,
+    NodeKind,
+    NodeSpec,
+    WorkflowGraph,
+)
 from ases.kernel.hashing import digest
 from ases.kernel.state import LEGAL_TRANSITIONS, NodeStatus, RunState, RunStatus, apply
 from ases.kernel.store.base import EventStore
@@ -73,9 +98,47 @@ class NodeExecutionOutcome(BaseModel):
     artifact_kind: str | None = None
     artifact_payload: Mapping[str, object] | None = None
     error: str | None = None
+    #: Why it failed, classified by the executor that made the call - see
+    #: `kernel.failures.FailureKind`. Diagnostic metadata recorded on
+    #: `NODE_FAILED`, deliberately **not** an input to routing: the graph's
+    #: edges decide what happens next, exactly as before. Ignored entirely
+    #: when `ok` is True.
+    failure_kind: FailureKind = FailureKind.ORCHESTRATION_FAILURE
     input_tokens: int = 0
     output_tokens: int = 0
     usd: float = 0.0
+
+
+class SubgraphProposal(BaseModel):
+    """Nodes and edges a node's output asks to add to the running graph.
+
+    Nothing here is a routing *decision*: a proposal names work to admit, and
+    the scheduler still decides what becomes ready and when, from the same
+    edge/join evaluation it applies to statically declared nodes. The
+    proposing component cannot dispatch anything, cannot reorder anything,
+    and cannot admit a node that `WorkflowGraph.validate_graph` rejects.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    nodes: tuple[NodeSpec, ...]
+    edges: tuple[Edge, ...]
+
+
+@runtime_checkable
+class SubgraphProvider(Protocol):
+    """Turns a settled node's artifact into a subgraph proposal, or `None`
+    when that node admits nothing (which is every node but one).
+
+    This exists so the kernel can admit a decomposer's plan without importing
+    the agent plane or knowing what a `TaskGraph` is: the concrete
+    implementation (`agents.planner.TaskGraphSubgraphProvider`) lives in the
+    agent plane where the contracts do, and is injected. `kernel/` stays
+    free of `contracts`/`agents` imports, which
+    `tests/invariants/test_layering.py` enforces.
+    """
+
+    def propose(self, node: NodeSpec, state: RunState) -> SubgraphProposal | None: ...
 
 
 @runtime_checkable
@@ -192,7 +255,13 @@ class Scheduler:
         approvals: ApprovalProvider | None = None,
         checkpoints: CheckpointStore | None = None,
         cancel_token: CancelToken | None = None,
+        subgraphs: SubgraphProvider | None = None,
     ) -> None:
+        #: Mutable **only** through `_admit_subgraph_for`, which replaces it
+        #: with a `with_subgraph` result that has already passed
+        #: `validate_graph`. Every other read of `self.graph` - readiness,
+        #: propagation, completion - sees a graph that is valid by
+        #: construction, exactly as it did when this was assigned once.
         self.graph = graph
         self.store = store
         self.executors = executors
@@ -200,6 +269,7 @@ class Scheduler:
         self.approvals = approvals
         self.checkpoints = checkpoints
         self.cancel_token = cancel_token or CancelToken()
+        self.subgraphs = subgraphs
         self._run_id: UUID | None = None
         self._state: RunState | None = None
 
@@ -209,6 +279,7 @@ class Scheduler:
         state = await resume(self.store, run_id, checkpoints=self.checkpoints)
         self._run_id = run_id
         self._state = state
+        self._readmit_recorded_subgraphs()
 
         if state.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.HALTED):
             return state  # resuming a finished run is a no-op, not an error
@@ -270,6 +341,7 @@ class Scheduler:
         state = await resume(self.store, run_id, checkpoints=self.checkpoints)
         self._run_id = run_id
         self._state = state
+        self._readmit_recorded_subgraphs()
         await self._ensure_started()
         await self._step()
         return state
@@ -430,6 +502,7 @@ class Scheduler:
             # tool latency) run together via gather. Only the *outcomes* are
             # applied sequentially afterwards, since event emission mutates
             # shared state and must not interleave.
+            assert self._state is not None
             outcomes = await asyncio.gather(
                 *(self.executors[_handler_of(n)].execute(n, self._state) for n in dispatch)
             )
@@ -614,13 +687,15 @@ class Scheduler:
                 node_id=node.id,
                 attempt=attempt,
                 error=outcome.error or "unknown error",
+                failure_kind=outcome.failure_kind.value,
             )
             await self._propagate_edge_completion(node.id)
             if not self._has_recovery_edge(node.id):
                 await self._emit(
                     EventType.RUN_FAILED,
                     reason=(
-                        f"node {node.id!r} failed with no ON_FAILURE recovery edge: {outcome.error}"
+                        f"node {node.id!r} failed ({outcome.failure_kind.value}) with no "
+                        f"ON_FAILURE recovery edge: {outcome.error}"
                     ),
                 )
             return
@@ -652,6 +727,13 @@ class Scheduler:
                 EventType.ARTIFACT_VALIDATED, node_id=node.id, artifact_hash=artifact_hash
             )
 
+        # Admission happens here - after the artifact exists in folded state
+        # (the provider reads it from there) and *before* the exit gate, so a
+        # proposal the graph refuses fails this node like any other bad
+        # output instead of having to un-succeed a node that already passed.
+        if not await self._admit_subgraph_for(node, attempt):
+            return
+
         await self._emit(
             EventType.NODE_EXIT_GATE, node_id=node.id, attempt=attempt, verdict=GateVerdict.PASS
         )
@@ -661,6 +743,116 @@ class Scheduler:
         else:
             await self._emit(EventType.NODE_SUCCEEDED, node_id=node.id, attempt=attempt)
             await self._propagate_edge_completion(node.id)
+
+    # -- dynamic subgraph admission -----------------------------------------
+
+    async def _admit_subgraph_for(self, node: NodeSpec, attempt: int) -> bool:
+        """Ask the injected provider whether `node`'s output admits new nodes;
+        admit them if the graph accepts them. Returns False if the node must
+        be failed instead.
+
+        This is the mechanism `kernel/scheduler.py`'s own docstring used to
+        list under "deliberately does not implement yet". The bound on it is
+        `WorkflowGraph.with_subgraph`, unchanged: a proposal is validated as a
+        whole candidate graph - no dangling edge, no duplicate id, no
+        unreachable node, no node that cannot reach a terminal, no unbounded
+        cycle - before it can execute. A rejected proposal never runs, and
+        the rejection is recorded (`SUBGRAPH_REJECTED`) rather than silently
+        dropped.
+
+        The admitted nodes and edges are written into the `SUBGRAPH_ADMITTED`
+        payload in full, not just their ids. That is what makes a run
+        resumable across processes: `_readmit_recorded_subgraphs` rebuilds the
+        same graph from the event log on the next `run()`, so a run that
+        crashed after admission does not come back with the static YAML's
+        graph and a state full of nodes that graph has never heard of.
+        """
+        if self.subgraphs is None:
+            return True
+        assert self._state is not None
+        try:
+            proposal = self.subgraphs.propose(node, self._state)
+        except ValueError as exc:
+            # The provider refused to build a proposal at all - see the
+            # `except ValueError` below for why this is caught by base type.
+            await self._emit(EventType.SUBGRAPH_REJECTED, node_id=node.id, reason=str(exc))
+            await self._emit(
+                EventType.NODE_FAILED,
+                node_id=node.id,
+                attempt=attempt,
+                error=f"proposed plan could not be admitted: {exc}",
+                failure_kind=FailureKind.ORCHESTRATION_FAILURE,
+            )
+            await self._propagate_edge_completion(node.id)
+            if not self._has_recovery_edge(node.id):
+                await self._emit(
+                    EventType.RUN_FAILED,
+                    reason=f"node {node.id!r} proposed a plan that cannot be executed: {exc}",
+                )
+            return False
+        if proposal is None:
+            return True
+
+        await self._emit(
+            EventType.SUBGRAPH_PROPOSED,
+            node_id=node.id,
+            node_ids=[n.id for n in proposal.nodes],
+            edge_count=len(proposal.edges),
+        )
+        try:
+            candidate = self.graph.with_subgraph(proposal.nodes, proposal.edges)
+        except ValueError as exc:
+            # `GraphError` (the graph refused the shape) and any
+            # `ValueError` the provider itself raises while building the
+            # proposal - `agents.planner.SubgraphPlanError`, for a plan that
+            # names a project the scaffold never created or leaves one
+            # nobody implements. Caught as `ValueError` rather than by
+            # concrete type because `kernel/` must not import the agent plane
+            # (tests/invariants/test_layering.py); both are deliberately
+            # `ValueError` subclasses for exactly this reason.
+            await self._emit(EventType.SUBGRAPH_REJECTED, node_id=node.id, reason=str(exc))
+            await self._emit(
+                EventType.NODE_FAILED,
+                node_id=node.id,
+                attempt=attempt,
+                error=f"proposed subgraph was rejected: {exc}",
+                failure_kind=FailureKind.ORCHESTRATION_FAILURE,
+            )
+            await self._propagate_edge_completion(node.id)
+            if not self._has_recovery_edge(node.id):
+                await self._emit(
+                    EventType.RUN_FAILED,
+                    reason=f"node {node.id!r} proposed a subgraph the graph rejected: {exc}",
+                )
+            return False
+
+        self.graph = candidate
+        await self._emit(
+            EventType.SUBGRAPH_ADMITTED,
+            node_id=node.id,
+            node_ids=[n.id for n in proposal.nodes],
+            nodes=[n.model_dump(mode="json") for n in proposal.nodes],
+            edges=[e.model_dump(mode="json") for e in proposal.edges],
+        )
+        return True
+
+    def _readmit_recorded_subgraphs(self) -> None:
+        """Re-apply every subgraph this run already admitted, from the folded
+        event log, so a resumed run executes the graph it was actually
+        running rather than the static file it started from.
+
+        Re-validated on the way in exactly like a fresh proposal: an export
+        that was tampered with cannot smuggle in a node shape `validate_graph`
+        would refuse. Idempotent - a subgraph whose nodes are already present
+        is skipped, so calling this on an in-process resume is harmless.
+        """
+        assert self._state is not None
+        for record in self._state.admitted_subgraphs:
+            nodes = tuple(NodeSpec.model_validate(n) for n in record.get("nodes", ()))
+            edges = tuple(Edge.model_validate(e) for e in record.get("edges", ()))
+            if not nodes or all(n.id in self.graph.by_id for n in nodes):
+                continue
+            self.graph = self.graph.with_subgraph(nodes, edges)
 
     # -- completion ---------------------------------------------------------
 

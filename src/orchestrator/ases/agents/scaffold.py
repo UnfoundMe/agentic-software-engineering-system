@@ -45,13 +45,25 @@ ever reference - a `dotnet build` failure the repair loop has no way to fix.
 The naming convention is stated to the model in the prompt below, not just
 assumed of it.
 
-**Package installation, the third structural gap this closes:**
-`pinned_packages` used to be reported in the artifact and never actually
-installed anywhere - `dotnet.add_package` now installs every listed package
-into every project. Deliberately solution-wide rather than per-project
-(docs/03's example workload needs the same EF Core/Npgsql packages in more
-than one layer, and `SolutionSkeleton` has no per-project package mapping to
-route from) - a disclosed simplification, not a full dependency scope.
+**Package installation, routed per project since `PROMPT_VERSION` 3:**
+`pinned_packages` used to be reported in the artifact and never installed at
+all; then it was installed solution-wide, into every project. Live run
+`009ea59f-...` showed what that costs, twice over. It put EF Core, Npgsql,
+StackExchange.Redis, xunit and NetArchTest into `UrlShortener.Domain` - a
+project CLAUDE.md section 9 requires to depend on none of them - and it put
+two `Microsoft.Extensions.*.Abstractions` packages into the
+`Microsoft.NET.Sdk.Web` API project, where .NET 10 package pruning rejects a
+reference the shared framework already supplies (`NU1510`, an error under
+`-warnaserror`), failing restore before any C# compiled.
+
+`SolutionSkeleton.project_packages` now carries the routing, declared by
+this agent rather than inferred from project names by the orchestrator:
+which layer needs which package is an architecture fact the agent that chose
+the architecture knows. `_packages_for` resolves it, falling back to the old
+solution-wide behaviour for an artifact that states no routing.
+`_FRAMEWORK_SUPPLIED_PACKAGES` is the deterministic backstop for the
+`NU1510` half - see its own docstring for why it is web-host-only and an
+explicit list rather than a prefix match.
 
 **No pinned version is ever installed, by design, not merely by omission.**
 `pinned_packages` asks the model for a bare package id (`_package_id`
@@ -78,6 +90,58 @@ from ases.kernel.policy import CapabilityManifest
 from ases.providers.models import ModelNeeds
 from ases.providers.prompts.registry import PromptRegistry, PromptTemplate
 
+#: Package ids the .NET 10 **shared framework** already supplies to an
+#: ASP.NET Core web host, which `RestoreEnablePackagePruning` (on by default
+#: from net10.0) rejects as an explicit `PackageReference`: `NU1510`, an
+#: error under `dotnet build -warnaserror`, raised at restore before any
+#: compilation happens at all.
+#:
+#: Applied **only to web-host projects** (`_template_for` -> `webapi`), and
+#: that narrowness is deliberate rather than incidental: these same ids are
+#: ordinary, legitimately-referenced NuGet packages for a plain
+#: `Microsoft.NET.Sdk` class library, which is exactly what the live run
+#: showed - `UrlShortener.Domain`/`.Application`/`.Infrastructure` carried
+#: `Microsoft.Extensions.Configuration.Abstractions` with no diagnostic at
+#: all, while `UrlShortener.Api` failed restore on it. Stripping it
+#: everywhere would break a class library that genuinely needs it.
+#:
+#: An explicit list, not a prefix match: `Microsoft.AspNetCore.OpenApi` and
+#: `Microsoft.Extensions.Caching.StackExchangeRedis` are *not* in the shared
+#: framework despite sharing those prefixes, and silently dropping either
+#: would trade `NU1510` for a `CS0246` that is harder to trace. The list is
+#: narrow on purpose: it is a backstop for what the model still gets wrong
+#: after `project_packages` (PROMPT_VERSION 3) asks it not to, not the
+#: primary mechanism. If a future run hits `NU1510` on an id absent here,
+#: the fix is one more entry, not a redesign.
+_FRAMEWORK_SUPPLIED_PACKAGES: frozenset[str] = frozenset(
+    {
+        "microsoft.extensions.caching.abstractions",
+        "microsoft.extensions.caching.memory",
+        "microsoft.extensions.configuration",
+        "microsoft.extensions.configuration.abstractions",
+        "microsoft.extensions.configuration.binder",
+        "microsoft.extensions.configuration.commandline",
+        "microsoft.extensions.configuration.environmentvariables",
+        "microsoft.extensions.configuration.fileextensions",
+        "microsoft.extensions.configuration.json",
+        "microsoft.extensions.dependencyinjection",
+        "microsoft.extensions.dependencyinjection.abstractions",
+        "microsoft.extensions.fileproviders.abstractions",
+        "microsoft.extensions.fileproviders.physical",
+        "microsoft.extensions.hosting",
+        "microsoft.extensions.hosting.abstractions",
+        "microsoft.extensions.http",
+        "microsoft.extensions.logging",
+        "microsoft.extensions.logging.abstractions",
+        "microsoft.extensions.logging.configuration",
+        "microsoft.extensions.logging.console",
+        "microsoft.extensions.options",
+        "microsoft.extensions.options.configurationextensions",
+        "microsoft.extensions.primitives",
+    }
+)
+
+
 PROMPT_NAME = "scaffold.plan"
 #: v2 (was v1): `pinned_packages` used to ask for "PackageId/Version"
 #: explicitly, and two live runs showed the version half is a liability, not
@@ -93,7 +157,25 @@ PROMPT_NAME = "scaffold.plan"
 #: the model happening to remember the right number. `_package_id` below
 #: enforces this regardless of what the model still writes - see its own
 #: docstring.
-PROMPT_VERSION = 2
+#: v3 (was v2): `pinned_packages` was installed into *every* project
+#: (`_materialize_project`'s old solution-wide loop), which a live run
+#: (`009ea59f-...`) showed to be two separate defects at once. It put EF
+#: Core, Npgsql, StackExchange.Redis, xunit and NetArchTest into
+#: `UrlShortener.Domain` - a project CLAUDE.md section 9 requires to depend
+#: on none of them - and it put `Microsoft.Extensions.Configuration.Abstractions`
+#: and `Microsoft.Extensions.DependencyInjection.Abstractions` into the
+#: `Microsoft.NET.Sdk.Web` API project, where .NET 10's package pruning
+#: rejects a reference the shared framework already supplies: `NU1510`,
+#: promoted to an error by `dotnet build -warnaserror`, failing restore
+#: before a single line of C# was compiled. The repair agent then "fixed"
+#: that by writing a solution-wide `Directory.Build.props` setting
+#: `RestoreEnablePackagePruning=false` and `NoWarn=NU1510` - suppressing the
+#: diagnostic instead of removing its cause, which is not an acceptable
+#: outcome. v3 asks for `project_packages` so each package lands only where
+#: its layer actually needs it; `_FRAMEWORK_SUPPLIED_PACKAGES` below is the
+#: deterministic backstop for the `NU1510` half, regardless of what the
+#: model answers.
+PROMPT_VERSION = 4
 PROMPT_TEMPLATE = """You are the Scaffold Agent in a governed software \
 engineering system. You never decide what happens next in the workflow - \
 you only turn an approved design into a concrete, buildable project list \
@@ -123,10 +205,32 @@ include a version number: every project already targets .NET 10, and the \
 latest stable release of each package compatible with that target is \
 resolved automatically: a version guessed here would only ever be \
 overridden, or worse, pin something older and potentially insecure.
-- frozen_interfaces: the interface and DTO signatures (as short C# \
-declarations, one per line) that cross a project boundary - freezing these \
-now is what lets independent implementation tasks compile without waiting \
-on each other."""
+- project_packages: which of those packages each project actually \
+needs, as one entry per project (project, packages). This is required, \
+not optional: a package installed into a project that does not need it \
+is a real architecture violation, not untidiness - a domain/business-\
+rules project that references a database, cache or web framework breaks \
+the layering this design is required to maintain, and a test-only \
+package (xunit, Microsoft.NET.Test.Sdk, NetArchTest.Rules) in a \
+production project ships test infrastructure into it. List a project \
+with an empty packages list if it genuinely needs none - a pure domain \
+layer usually does. Never list a package the .NET 10 shared framework \
+already supplies for that project's SDK (for an ASP.NET Core web host \
+that includes the Microsoft.Extensions.* configuration, dependency-\
+injection, logging, options and hosting packages): referencing one of \
+those fails restore outright under package pruning.
+- frozen_interfaces: every type that crosses a project boundary. Each \
+entry needs three things: `signature` (a short C# declaration), \
+`project` (which of the projects above declares it), and `namespace` \
+(the exact C# namespace it will be declared in). The namespace is not \
+optional and not a suggestion: the task that writes the type declares \
+exactly this namespace, and every task that consumes it imports \
+exactly this namespace. Prefer the project's root namespace - if the \
+project is UrlShortener.Application say `UrlShortener.Application`, \
+not `UrlShortener.Application.Abstractions`, unless the type genuinely \
+needs a sub-namespace. A signature without a namespace is what lets \
+one task declare a type in one place while another imports it from \
+somewhere else, with both looking correct in isolation."""
 
 
 def register_prompts(registry: PromptRegistry) -> None:
@@ -187,6 +291,35 @@ class ScaffoldAgent:
         suffix = project.rsplit(".", 1)[-1].lower()
         return "webapi" if suffix in cls._WEB_HOST_SUFFIXES else "classlib"
 
+    def _packages_for(self, skeleton: SolutionSkeleton, project: str) -> tuple[str, ...]:
+        """The packages that actually get installed into `project`.
+
+        `SolutionSkeleton.project_packages` (PROMPT_VERSION 3) is the routing
+        the model declared - which layer needs what is an architecture fact
+        the agent that chose the architecture knows, and is deliberately not
+        re-derived here from project names. When it is empty (an older
+        artifact, or a model that answered without it) this falls back to the
+        previous solution-wide behaviour rather than installing nothing:
+        silently producing a package-less solution would be a worse failure
+        than the over-broad one this replaces, and much harder to read off a
+        `dotnet build` log.
+
+        `_FRAMEWORK_SUPPLIED_PACKAGES` is then subtracted for a web host
+        either way - that part is not the model's to get right, see its own
+        docstring.
+        """
+        routed = {entry.project: entry.packages for entry in skeleton.project_packages}
+        declared = routed.get(project) if routed else None
+        if declared is None:
+            declared = () if routed else skeleton.pinned_packages
+        if self._template_for(project) != "webapi":
+            return tuple(declared)
+        return tuple(
+            spec
+            for spec in declared
+            if self._package_id(spec).lower() not in _FRAMEWORK_SUPPLIED_PACKAGES
+        )
+
     @staticmethod
     def _package_id(spec: str) -> str:
         """The bare package id `dotnet.add_package` is called with - never a
@@ -214,11 +347,11 @@ class ScaffoldAgent:
         project: str,
         *,
         reference: str | None,
-        pinned_packages: tuple[str, ...],
+        packages: tuple[str, ...],
     ) -> None:
         """`dotnet.new` (template chosen by `_template_for`), `dotnet.sln_add`,
         an optional `dotnet.add_reference` to the prior project in the chain,
-        then every pinned package - one project's worth of the four
+        then every package `_packages_for` routed here - one project's worth of the four
         structural steps this module's docstring describes. Raises
         `ScaffoldToolFailureError` on the first tool failure."""
         template = self._template_for(project)
@@ -243,7 +376,7 @@ class ScaffoldAgent:
                     f"dotnet.add_reference failed: {project!r} -> {reference!r}: {referenced.error}"
                 )
 
-        for spec in pinned_packages:
+        for spec in packages:
             package_id = self._package_id(spec)
             installed = await ctx.invoke_tool(
                 "dotnet.add_package", project=project, package=package_id
@@ -279,10 +412,15 @@ class ScaffoldAgent:
                     f"dotnet.new_sln failed for {solution_name!r}: {sln_result.error}"
                 )
 
+        installed = 0
         for index, project in enumerate(artifact.projects):
             previous = artifact.projects[index - 1] if index > 0 else None
+            installed += len(self._packages_for(artifact, project))
             await self._materialize_project(
-                ctx, project, reference=previous, pinned_packages=artifact.pinned_packages
+                ctx,
+                project,
+                reference=previous,
+                packages=self._packages_for(artifact, project),
             )
 
         return AgentResult(
@@ -292,9 +430,9 @@ class ScaffoldAgent:
                 f"Planned via {PROMPT_NAME}@v{PROMPT_VERSION} from the approved design, then "
                 f"materialized for real via dotnet.new for each of {len(artifact.projects)} "
                 "project(s), linked into one .sln, chain-referenced in the declared dependency "
-                f"order, and installed with {len(artifact.pinned_packages)} pinned package(s) "
-                "each - see this module's docstring on the linear-chain and "
-                "solution-wide-package simplifications."
+                f"order, and installed with {installed} package reference(s) routed per project "
+                "from project_packages - see this module's docstring on the linear-chain "
+                "simplification."
             ),
             citations=(Citation(source=f"artifact:{self.UPSTREAM_NODE_ID}"),),
             usage=usage,

@@ -71,10 +71,30 @@ async def test_build_args_is_consulted_and_passed_to_the_tool() -> None:
         "scan",
         tools=_registry("scan", _capturing_handler),
         tool_cwd=PurePosixPath("/sb"),
-        build_args=lambda retriever: {"content": "some code"},
+        build_args=lambda retriever, node: {"content": "some code"},
     )
     await executor.execute(_node(), RunState(run_id=uuid4()))
     assert captured["args"] == {"content": "some code"}
+
+
+async def test_build_args_sees_the_node_it_is_building_for() -> None:
+    """One registered handler serves every dynamically admitted build
+    node, so the args builder has to be able to tell them apart - it
+    resolves each node's project from the task that node belongs to."""
+    captured: dict[str, object] = {}
+
+    async def _capturing_handler(args: object, ctx: object) -> ToolOutcome:
+        captured["args"] = args
+        return ToolOutcome(ok=True)
+
+    executor = ToolNodeExecutor(
+        "scan",
+        tools=_registry("scan", _capturing_handler),
+        tool_cwd=PurePosixPath("/sb"),
+        build_args=lambda retriever, node: {"project": node.id},
+    )
+    await executor.execute(_node(), RunState(run_id=uuid4()))
+    assert captured["args"] == {"project": _node().id}
 
 
 async def test_build_artifact_produces_a_tracked_artifact_when_findings_exist() -> None:

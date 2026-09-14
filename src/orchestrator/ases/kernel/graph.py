@@ -134,6 +134,18 @@ class NodeSpec(BaseModel):
     exit_gates: tuple[str, ...] = ()
     produces: str | None = None  # artifact kind, for lineage
     retry: RetryPolicy = RetryPolicy()
+    #: How long the workflow author expects this node to need. Advisory: the
+    #: scheduler does **not** cancel a node that exceeds it, and deliberately
+    #: so. Execution is already bounded at the two layers that can attribute a
+    #: stall to something specific - `kernel.tools.registry` wraps every tool
+    #: invocation in `asyncio.wait_for(..., spec.timeout_s)`, and the provider
+    #: SDK bounds each HTTP call - and a third ceiling on top of those could
+    #: only cut short work those layers considered healthy. It briefly did
+    #: exactly that: a live run cancelled `scaffold` at its declared 120s on a
+    #: call that had taken 201s successfully the run before, ending the run
+    #: after two human approvals. Read this as documentation of intent, not as
+    #: a guarantee; `kernel/scheduler.py`'s module docstring states the
+    #: residual gap this leaves.
     timeout_seconds: float = Field(default=300.0, gt=0)
     #: Required on at least one node of every cycle. Without it a repair loop
     #: could run forever, so an unbudgeted cycle is rejected at load time.

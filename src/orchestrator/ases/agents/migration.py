@@ -31,31 +31,30 @@ docstring for the classifier's OPAQUE reinterpretation):
   "generate and classify, never blindly apply" - steps 1-6 plus the gated
   apply step (8) itself.
 - This agent reads only the domain implementation's `CodePatch` (`impl_domain`),
-  not `impl_api` - domain entities are what a migration's shape actually
-  follows from. **Correction:** an earlier version of this note claimed the
-  `DbContext` itself lives in the domain layer; it does not - docs/03's own
-  reference layout (line ~138) places it in `UrlShortener.Infrastructure`
-  alongside repository implementations, and `claude.md` section 9 forbids
-  Domain from depending on EF Core at all, which a `DbContext` subclass
-  always does. `impl_domain`'s own focus text already says "zero
-  infrastructure deps" for exactly this reason.
-- **Disclosed gap, not yet hit by a live run when first written, since found
-  to be the actual next blocker (docs/07 section on `migration`):**
+  not `impl_api`/`impl_infrastructure` - domain entities are what a
+  migration's shape actually follows from. **Correction:** an earlier version
+  of this note claimed the `DbContext` itself lives in the domain layer; it
+  does not - docs/03's own reference layout (line ~138) places it in
+  `UrlShortener.Infrastructure` alongside repository implementations, and
+  `claude.md` section 9 forbids Domain from depending on EF Core at all,
+  which a `DbContext` subclass always does. `impl_domain`'s own focus text
+  already says "zero infrastructure deps" for exactly this reason. This
+  agent does not need to read `impl_infrastructure`'s `CodePatch` either: its
+  LLM call only ever decides a migration name and rationale (never the SQL),
+  and `dotnet ef migrations add`/`_script` read the *compiled sandbox*
+  directly, not anything this agent's own prompt sees.
+- **`workflows/greenfield.yaml`'s `migration` node requires
+  `build_infrastructure` to have succeeded too, not just `build_domain`.**
   `docs/04` section 4.2's step 1 requires "Implementer agent writes entities
-  + DbContext" before migration generation can do anything at all - but
-  `workflows/greenfield.yaml` only wires `impl_domain` (entities) and
-  `impl_api` (controllers); nothing implements Infrastructure, so no
-  `DbContext` is ever written by any agent in this workflow today. `dotnet ef
+  + DbContext" before migration generation can do anything - `dotnet ef
   migrations add` (design-time) discovers a `DbContext` via the startup
-  project's DI container or a parameterless constructor - with none written
-  anywhere in the sandbox, it will fail deterministically the first time a
-  live run actually reaches it, and `migration` has no `ON_FAILURE` recovery
-  edge, so that failure ends the run outright. Fixing this for real means
-  adding a third implementation position (`impl_infrastructure`, with its own
-  `build_infrastructure`/`repair_infrastructure`, mirroring `impl_domain`/
-  `impl_api` exactly) - a real topology change to `workflows/greenfield.yaml`
-  and `agents/wiring.py`, not attempted here without that decision being made
-  explicitly.
+  project's DI container or a parameterless constructor, and without
+  `impl_infrastructure`/`build_infrastructure` actually existing and
+  succeeding first, no `DbContext` would ever be there to discover.
+  `migration`'s `join: quorum, quorum: 2` (not `any`) is what enforces this -
+  see the workflow YAML's own header comment for why `any` (correct for
+  every other redo-producer, which each have only one real prerequisite)
+  would be wrong here specifically.
 
 **`--project`/`--startup-project` targeting, and its own disclosed
 heuristic:** `dotnet ef` auto-discovers a lone project in the working
@@ -97,6 +96,7 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict
 
 from ases.agents.base import Agent, AgentContext, AgentExecutionError, AgentResult, Citation
+from ases.agents.planner import implementation_node_ids, implementation_patches
 from ases.context.retriever import NoArtifactFromNodeError
 from ases.contracts.artifacts import CodePatch, MigrationPlan, SolutionSkeleton
 from ases.kernel.policy import CapabilityManifest
@@ -220,7 +220,7 @@ class _MigrationProposal(BaseModel):
 class MigrationAgentInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    domain_patch: CodePatch
+    implementations: tuple[CodePatch, ...] = ()
     skeleton: SolutionSkeleton
     prior_rejection: str | None = None
     previous_migration_name: str | None = None
@@ -241,14 +241,18 @@ class MigrationAgent:
     )
     model_needs: ClassVar[ModelNeeds] = ModelNeeds(reasoning="medium", structured_output=True)
 
-    DOMAIN_NODE_ID: ClassVar[str] = "impl_domain"
+    #: `impl_domain` used to be named here. It no longer exists: implementation
+    #: nodes are admitted at runtime from the decomposer's plan, and which of
+    #: them holds the entity definitions is not something this agent can know
+    #: by node id. It reads every implementation patch the run produced
+    #: instead - a superset of what it read before, and the entity types EF
+    #: Core needs are in there wherever the architecture put them.
     SKELETON_NODE_ID: ClassVar[str] = "scaffold"
     GATE_NODE_ID: ClassVar[str] = "migration_gate"
 
     def build_input(self, ctx: AgentContext) -> MigrationAgentInput:
-        domain_patch = ctx.retriever.fetch_latest_from(self.DOMAIN_NODE_ID)
+        implementations = implementation_patches(ctx.retriever.state)
         skeleton = ctx.retriever.fetch_latest_from(self.SKELETON_NODE_ID)
-        assert isinstance(domain_patch, CodePatch)
         assert isinstance(skeleton, SolutionSkeleton)
         prior_rejection = ctx.retriever.rejection_reason_of(self.GATE_NODE_ID)
         previous_migration_name = None
@@ -265,7 +269,7 @@ class MigrationAgent:
             except NoArtifactFromNodeError:
                 pass  # first attempt somehow reached here with no prior output - fine
         return MigrationAgentInput(
-            domain_patch=domain_patch,
+            implementations=implementations,
             skeleton=skeleton,
             prior_rejection=prior_rejection,
             previous_migration_name=previous_migration_name,
@@ -289,8 +293,12 @@ class MigrationAgent:
             prompt_name=PROMPT_NAME,
             prompt_version=PROMPT_VERSION,
             variables={
-                "domain_patch_summary": inp.domain_patch.summary,
-                "file_paths": ", ".join(f.path for f in inp.domain_patch.files) or "(none)",
+                "domain_patch_summary": "; ".join(p.summary for p in inp.implementations)
+                or "(none)",
+                "file_paths": ", ".join(
+                    f.path for patch in inp.implementations for f in patch.files
+                )
+                or "(none)",
                 "prior_rejection_section": prior_rejection_section,
             },
             output_schema=_MigrationProposal,
@@ -346,7 +354,10 @@ class MigrationAgent:
                 "see workflows/greenfield.yaml's migration_gate."
             ),
             citations=(
-                Citation(source=f"artifact:{self.DOMAIN_NODE_ID}"),
+                *(
+                    Citation(source=f"artifact:{node_id}")
+                    for node_id in implementation_node_ids(ctx.retriever.state)
+                ),
                 Citation(source=f"artifact:{self.SKELETON_NODE_ID}"),
             ),
             usage=usage,
